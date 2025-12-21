@@ -47,15 +47,17 @@ int main() {
     std::cout << "TIMESTAMP | ACTION | ID | PRICE | QTY | RESULT\n";
     std::cout << "------------------------------------------------\n";
 
+    book.Warmup();
+
     for (const auto& event : feed) {
         // --- 1. Event Processing ---
         Trades trades;
         
         if (event.type == "ADD") {
-            auto order = std::make_shared<Order>(
+            auto order = std::make_unique<Order>(
                 event.orderId, event.side, event.price, event.quantity, event.timestamp
             );
-            trades = book.AddOrder(order);
+            trades = book.AddOrder(std::move(order));
         }
         else if (event.type == "CANCEL") {
             book.CancelOrder(event.orderId);

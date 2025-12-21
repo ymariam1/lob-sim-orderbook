@@ -84,7 +84,7 @@ private:
         Quantity filledQuantity_{0};
 };
 
-using OrderPointer = std::shared_ptr<Order>;
+using OrderPointer = std::unique_ptr<Order>;
 using OrderPointers = std::deque<OrderPointer>;
 
 class OrderModify {
@@ -99,7 +99,7 @@ public:
     uint64_t GetTimestamp() const { return timestamp_; }
 
     OrderPointer toOrderPointer() const {
-        return std::make_shared<Order>(GetOrderId(), GetSide(), GetPrice(), GetQuantity(), GetTimestamp());
+        return std::make_unique<Order>(GetOrderId(), GetSide(), GetPrice(), GetQuantity(), GetTimestamp());
     }
 private:
     OrderId orderId_;
@@ -133,8 +133,9 @@ using Trades = std::vector<Trade>;
 class Orderbook {
 private:
     struct OrderEntry {
-        OrderPointer order_{ nullptr };
         std::size_t index_;
+        Price price_;
+        Side side_;
     };
 
     std::map<Price, OrderPointers, std::greater<Price>> bids_;
@@ -216,17 +217,20 @@ private:
 
                 Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
                 Price executionPrice = (bid->GetTimestamp() < ask->GetTimestamp()) ? bid->GetPrice() : ask->GetPrice();
+                OrderId bidOrderId = bid->GetOrderId();
+                OrderId askOrderId = ask->GetOrderId();
+                
                 bid->Fill(quantity);
                 ask->Fill(quantity);
 
                 if (bid->IsFilled()) {
                     bids.pop_front();
-                    orders_.erase(bid->GetOrderId());
+                    orders_.erase(bidOrderId);
                     UpdateIndicesAfterFrontRemoval(bidPrice, Side::BUY);
                 }
                 if (ask->IsFilled()) {
                     asks.pop_front();
-                    orders_.erase(ask->GetOrderId());
+                    orders_.erase(askOrderId);
                     UpdateIndicesAfterFrontRemoval(askPrice, Side::SELL);
                 }
 
@@ -238,8 +242,8 @@ private:
                 }
                 
                 trades.push_back(Trade{ 
-                    TradeInfo{ bid->GetOrderId(), executionPrice, quantity }, 
-                    TradeInfo{ ask->GetOrderId(), executionPrice, quantity } 
+                    TradeInfo{ bidOrderId, executionPrice, quantity }, 
+                    TradeInfo{ askOrderId, executionPrice, quantity } 
                 });
             }
         }
@@ -247,24 +251,28 @@ private:
     }
 public:
 
-    Trades AddOrder(OrderPointer order) {
-        if (orders_.contains(order->GetOrderId())) {
+    Trades AddOrder(OrderPointer&& order) {
+        OrderId orderId = order->GetOrderId();
+        Price price = order->GetPrice();
+        Side side = order->GetSide();
+        
+        if (orders_.contains(orderId)) {
             return { };
         }
 
         std::size_t index;
-        if (order->GetSide() == Side::BUY) {
-            auto& orders = bids_[order->GetPrice()];
-            orders.push_back(order);
+        if (side == Side::BUY) {
+            auto& orders = bids_[price];
+            orders.push_back(std::move(order));
             index = orders.size() - 1;
         }
         else {
-            auto& orders = asks_[order->GetPrice()];
-            orders.push_back(order);
+            auto& orders = asks_[price];
+            orders.push_back(std::move(order));
             index = orders.size() - 1;
         }
 
-        orders_.insert({ order->GetOrderId(), OrderEntry{ order, index} });
+        orders_.insert({ orderId, OrderEntry{ index, price, side } });
         return MatchOrders();
     }
 
@@ -272,9 +280,10 @@ public:
         if (!orders_.contains(orderId)) {
             return;
         }
-        const auto& [order, orderIndex] = orders_.at(orderId);
-        auto price = order->GetPrice();
-        auto side = order->GetSide();
+        const auto& entry = orders_.at(orderId);
+        auto price = entry.price_;
+        auto side = entry.side_;
+        auto orderIndex = entry.index_;
         orders_.erase(orderId);
 
         if (side == Side::SELL) {
@@ -297,17 +306,32 @@ public:
     }
 
     Trades ModifyOrder(OrderModify order) {
-        if (!orders_.contains(order.GetOrderId())) {
+        OrderId orderId = order.GetOrderId();
+        if (!orders_.contains(orderId)) {
             return { };
         }
-        const auto& [existingOrder, existingIndex] = orders_.at(order.GetOrderId());
+        const auto& entry = orders_.at(orderId);
+        auto price = entry.price_;
+        auto side = entry.side_;
+        auto index = entry.index_;
+        
+        // Get the existing order from the deque
+        OrderPointer* existingOrderPtr = nullptr;
+        if (side == Side::SELL) {
+            auto& orders = asks_.at(price);
+            existingOrderPtr = &orders[index];
+        } else {
+            auto& orders = bids_.at(price);
+            existingOrderPtr = &orders[index];
+        }
+        auto& existingOrder = *existingOrderPtr;
 
         // If Price changes OR Quantity increases, we lose priority (Cancel + New).
         if (order.GetPrice() != existingOrder->GetPrice() || 
             order.GetQuantity() > existingOrder->GetInitialQuantity()) {
             
-            CancelOrder(order.GetOrderId());
-            return AddOrder(order.toOrderPointer());
+            CancelOrder(orderId);
+            return AddOrder(std::move(order.toOrderPointer()));
         }
 
         // Resizing Down maintains priority
@@ -337,6 +361,20 @@ public:
         }
         return OrderbookLevelInfos{ bidInfos, askInfos };
     }
+
+    void Warmup() {
+        // Run dummy orders through the Hot Path to prime the Instruction Cache (I-Cache)
+        for(int i=0; i<1000; ++i) {
+            // Place a Buy and immediately Sell into it to trigger matching logic
+            AddOrder(std::make_unique<Order>(1000+i, Side::BUY, 1000, 10, 0));
+            AddOrder(std::make_unique<Order>(2000+i, Side::SELL, 1000, 10, 0));
+        }
+        // Reset book state after warmup
+        orders_.clear();
+        bids_.clear();
+        asks_.clear();
+    }
+
 };
 
 #endif
