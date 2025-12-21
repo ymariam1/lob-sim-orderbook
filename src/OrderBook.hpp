@@ -49,6 +49,7 @@ public:
         Quantity GetInitialQuantity() const { return initialQuantity_; }
         Quantity GetRemainingQuantity() const { return remainingQuantity_; }
         Quantity GetFilledQuantity() const { return filledQuantity_; }
+        uint64_t GetTimestamp() const { return timestamp_; }
         bool IsFilled() const { return GetRemainingQuantity() == 0; }
         void Fill(Quantity quantity) {
             if (quantity > GetRemainingQuantity()) {
@@ -153,8 +154,9 @@ private:
         // After removing front element (index 0), all remaining indices shift down by 1
         for (std::size_t i = 0; i < orders->size(); ++i) {
             auto orderId = (*orders)[i]->GetOrderId();
-            if (orders_.contains(orderId)) {
-                orders_.at(orderId).index_ = i;
+            auto it = orders_.find(orderId);
+            if (it != orders_.end()) {
+                it->second.index_ = i;
             }
         }
     }
@@ -172,8 +174,9 @@ private:
         // After removing element at removedIndex, all indices after it shift down by 1
         for (std::size_t i = removedIndex; i < orders->size(); ++i) {
             auto orderId = (*orders)[i]->GetOrderId();
-            if (orders_.contains(orderId)) {
-                orders_.at(orderId).index_ = i;
+            auto it = orders_.find(orderId);
+            if (it != orders_.end()) {
+                it->second.index_ = i;
             }
         }
     }
@@ -212,6 +215,7 @@ private:
                 auto& ask = asks.front();
 
                 Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
+                Price executionPrice = (bid->GetTimestamp() < ask->GetTimestamp()) ? bid->GetPrice() : ask->GetPrice();
                 bid->Fill(quantity);
                 ask->Fill(quantity);
 
@@ -232,10 +236,10 @@ private:
                 if (asks.empty()) {
                     asks_.erase(askPrice);
                 }
-
+                
                 trades.push_back(Trade{ 
-                    TradeInfo{ bid->GetOrderId(), bid->GetPrice(), quantity }, 
-                    TradeInfo{ ask->GetOrderId(), ask->GetPrice(), quantity } 
+                    TradeInfo{ bid->GetOrderId(), executionPrice, quantity }, 
+                    TradeInfo{ ask->GetOrderId(), executionPrice, quantity } 
                 });
             }
         }
