@@ -191,7 +191,10 @@ private:
     }
 
     // Check if a GFD order is expired based on a reference timestamp
-    // Assumes timestamps are in seconds since epoch
+    // IMPORTANT: Assumes timestamps are in SECONDS since epoch
+    // If your timestamps are in nanoseconds, use: 86400000000000ULL
+    // If your timestamps are in microseconds, use: 86400000000ULL
+    // If your timestamps are in milliseconds, use: 86400000ULL
     static bool IsGFDExpired(uint64_t orderTimestamp, uint64_t referenceTimestamp) {
         constexpr uint64_t SECONDS_PER_DAY = 86400;
         uint64_t orderDay = orderTimestamp / SECONDS_PER_DAY;
@@ -211,6 +214,8 @@ private:
     }
 
     // Remove expired GFD order from front of queue
+    // Returns true if an order was removed, false otherwise
+    // NOTE: Does NOT erase the map entry - caller must handle that
     bool RemoveExpiredGFDFromFront(OrderPointers* orders, Price price, Side side, uint64_t referenceTimestamp) {
         if (!orders || orders->empty()) {
             return false;
@@ -223,14 +228,6 @@ private:
             orders->pop_front();
             orders_.erase(expiredOrderId);
             UpdateIndicesAfterFrontRemoval(price, side);
-            
-            if (orders->empty()) {
-                if (side == Side::SELL) {
-                    asks_.erase(price);
-                } else {
-                    bids_.erase(price);
-                }
-            }
             return true;
         }
         return false;
@@ -280,7 +277,7 @@ private:
     }
 
     // Aggressively match an incoming order against the book
-    Trades MatchAggressively(Order* incomingOrder) {
+    Trades Match(Order* incomingOrder) {
         Trades trades;
         Side side = incomingOrder->GetSide();
         Side oppositeSide = side == Side::BUY ? Side::SELL : Side::BUY;
@@ -289,175 +286,84 @@ private:
         OrderId incomingOrderId = incomingOrder->GetOrderId();
         
         while (!incomingOrder->IsFilled()) {
-            // Check if we can match
-            bool canMatch = false;
-            Price matchPrice = 0;
-            OrderPointers* oppositeOrders = nullptr;
-            Price oppositePrice = 0;
-            
-            if (side == Side::BUY) {
-                if (asks_.empty()) {
-                    break;
+            // 1. Check if book is empty
+            if (side == Side::BUY && asks_.empty()) break;
+            if (side == Side::SELL && bids_.empty()) break;
+
+            // 2. Get best level safely using iterator
+            auto bestIt = (side == Side::BUY) ? asks_.begin() : bids_.begin();
+            Price levelPrice = bestIt->first;
+            OrderPointers& levelOrders = bestIt->second;
+
+            // 3. Check price limits for limit orders
+            if (orderType == OrderType::LIMIT) {
+                if (side == Side::BUY && levelPrice > price) break;
+                if (side == Side::SELL && levelPrice < price) break;
+            }
+
+            // 4. Match loop for this level
+            while (!levelOrders.empty() && !incomingOrder->IsFilled()) {
+                // Skip expired GFD orders
+                while (RemoveExpiredGFDFromFront(&levelOrders, levelPrice, oppositeSide, incomingOrder->GetTimestamp())) {
+                    // Continue removing expired orders until we find a valid one or run out
                 }
-                auto askIt = asks_.begin();
-                matchPrice = askIt->first;
-                // Market orders match any ask, limit orders only if price >= ask price
-                if (orderType == OrderType::MARKET || price >= matchPrice) {
-                    canMatch = true;
-                    oppositeOrders = &askIt->second;
-                    oppositePrice = askIt->first;
-                }
-            } else { // SELL
-                if (bids_.empty()) {
-                    break;
-                }
-                auto bidIt = bids_.begin();
-                matchPrice = bidIt->first;
-                // Market orders match any bid, limit orders only if price <= bid price
-                if (orderType == OrderType::MARKET || price <= matchPrice) {
-                    canMatch = true;
-                    oppositeOrders = &bidIt->second;
-                    oppositePrice = bidIt->first;
-                }
-            }
-            
-            if (!canMatch || oppositeOrders->empty()) {
-                break;
-            }
-            
-            // Skip expired GFD orders
-            while (RemoveExpiredGFDFromFront(oppositeOrders, oppositePrice, oppositeSide, incomingOrder->GetTimestamp())) {
-                // Continue removing expired orders until we find a valid one or run out
-            }
-            
-            if (oppositeOrders->empty()) {
-                break; // No valid orders to match
-            }
-            
-            // Match against the best opposite order
-            auto& oppositeOrder = oppositeOrders->front();
-            Quantity matchQuantity = std::min(
-                incomingOrder->GetRemainingQuantity(),
-                oppositeOrder->GetRemainingQuantity()
-            );
-            
-            // Execution price: price-time priority (older order's price)
-            // For market orders, use the resting order's price (market orders don't have meaningful price)
-            Price executionPrice;
-            if (orderType == OrderType::MARKET) {
-                executionPrice = oppositeOrder->GetPrice();
-            } else {
-                executionPrice = (incomingOrder->GetTimestamp() < oppositeOrder->GetTimestamp()) 
-                    ? incomingOrder->GetPrice() 
-                    : oppositeOrder->GetPrice();
-            }
-            
-            // Fill both orders
-            incomingOrder->Fill(matchQuantity);
-            oppositeOrder->Fill(matchQuantity);
-            
-            OrderId oppositeOrderId = oppositeOrder->GetOrderId();
-            
-            // Remove filled opposite order from book
-            if (oppositeOrder->IsFilled()) {
-                oppositeOrders->pop_front();
-                orders_.erase(oppositeOrderId);
-                UpdateIndicesAfterFrontRemoval(oppositePrice, oppositeSide);
                 
-                // Remove price level if empty
-                if (oppositeOrders->empty()) {
-                    if (oppositeSide == Side::SELL) {
-                        asks_.erase(oppositePrice);
-                    } else {
-                        bids_.erase(oppositePrice);
+                if (levelOrders.empty()) {
+                    break; // No valid orders at this level
+                }
+                
+                auto& bookOrder = levelOrders.front();
+                Quantity matchQuantity = std::min(
+                    incomingOrder->GetRemainingQuantity(),
+                    bookOrder->GetRemainingQuantity()
+                );
+                
+                // Execution price: Always use the maker's (resting order's) price
+                Price executionPrice = bookOrder->GetPrice();
+                
+                // Fill both orders
+                incomingOrder->Fill(matchQuantity);
+                bookOrder->Fill(matchQuantity);
+                
+                OrderId bookOrderId = bookOrder->GetOrderId();
+                
+                // Record trade
+                if (side == Side::BUY) {
+                    trades.push_back(Trade{
+                        TradeInfo{ incomingOrderId, executionPrice, matchQuantity },
+                        TradeInfo{ bookOrderId, executionPrice, matchQuantity }
+                    });
+                } else {
+                    trades.push_back(Trade{
+                        TradeInfo{ bookOrderId, executionPrice, matchQuantity },
+                        TradeInfo{ incomingOrderId, executionPrice, matchQuantity }
+                    });
+                }
+                
+                // Remove filled order from book
+                if (bookOrder->IsFilled()) {
+                    orders_.erase(bookOrderId);
+                    levelOrders.pop_front();
+                    
+                    if (!levelOrders.empty()) {
+                        UpdateIndicesAfterFrontRemoval(levelPrice, oppositeSide);
                     }
                 }
             }
-            
-            // Record trade
-            if (side == Side::BUY) {
-                trades.push_back(Trade{
-                    TradeInfo{ incomingOrderId, executionPrice, matchQuantity },
-                    TradeInfo{ oppositeOrderId, executionPrice, matchQuantity }
-                });
-            } else {
-                trades.push_back(Trade{
-                    TradeInfo{ oppositeOrderId, executionPrice, matchQuantity },
-                    TradeInfo{ incomingOrderId, executionPrice, matchQuantity }
-                });
+
+            // 5. Clean up level if empty (safe because we break loop and re-evaluate next iter)
+            if (levelOrders.empty()) {
+                if (side == Side::BUY) {
+                    asks_.erase(bestIt);
+                } else {
+                    bids_.erase(bestIt);
+                }
             }
         }
         
         return trades;
     }
 
-    Trades MatchOrders() {
-        Trades trades;
-        trades.reserve(orders_.size());
-        while (true) {
-            if (bids_.empty() || asks_.empty()) {
-                break;
-            }
-
-            auto& [bidPrice, bids] = *bids_.begin();
-            auto& [askPrice, asks] = *asks_.begin();
-
-            if (bidPrice < askPrice) {
-                break;
-            }
-
-            while (bids.size() && asks.size()) {
-                auto& bid = bids.front();
-                auto& ask = asks.front();
-
-                // Skip expired GFD orders
-                if (RemoveExpiredGFDFromFront(&bids, bidPrice, Side::BUY, ask->GetTimestamp())) {
-                    if (bids.empty()) {
-                        bids_.erase(bidPrice);
-                    }
-                    continue;
-                }
-                
-                if (RemoveExpiredGFDFromFront(&asks, askPrice, Side::SELL, bid->GetTimestamp())) {
-                    if (asks.empty()) {
-                        asks_.erase(askPrice);
-                    }
-                    continue;
-                }
-
-                Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
-                Price executionPrice = (bid->GetTimestamp() < ask->GetTimestamp()) ? bid->GetPrice() : ask->GetPrice();
-                OrderId bidOrderId = bid->GetOrderId();
-                OrderId askOrderId = ask->GetOrderId();
-                
-                bid->Fill(quantity);
-                ask->Fill(quantity);
-
-                if (bid->IsFilled()) {
-                    bids.pop_front();
-                    orders_.erase(bidOrderId);
-                    UpdateIndicesAfterFrontRemoval(bidPrice, Side::BUY);
-                    if (bids.empty()) {
-                        bids_.erase(bidPrice);
-                    }
-                }
-                if (ask->IsFilled()) {
-                    asks.pop_front();
-                    orders_.erase(askOrderId);
-                    UpdateIndicesAfterFrontRemoval(askPrice, Side::SELL);
-                    if (asks.empty()) {
-                        asks_.erase(askPrice);
-                    }
-                }
-                
-                trades.push_back(Trade{ 
-                    TradeInfo{ bidOrderId, executionPrice, quantity }, 
-                    TradeInfo{ askOrderId, executionPrice, quantity } 
-                });
-            }
-        }
-        return trades;
-    }
 public:
 
     Trades AddOrder(OrderPointer&& order) {
@@ -472,7 +378,7 @@ public:
             return { };
         }
 
-        // Step 1: Check FOK - can we fill the whole thing right now?
+        // Check FOK - can we fill the whole thing right now?
         if (timeInForce == TimeInForce::FOK) {
             if (!CanFillFOK(side, price, initialQuantity, orderType)) {
                 // FOK order cannot be fully filled, reject it
@@ -480,10 +386,10 @@ public:
             }
         }
 
-        // Step 2: Match aggressively - try to match the incoming order against the book
-        Trades trades = MatchAggressively(order.get());
+        // Match incoming order with the book
+        Trades trades = Match(order.get());
 
-        // Step 3: Decide on remainder
+        // Decide on remainder
         bool shouldAddToBook = false;
         if (orderType == OrderType::LIMIT && 
             (timeInForce == TimeInForce::GTC || timeInForce == TimeInForce::GFD)) {
