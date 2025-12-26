@@ -5,7 +5,7 @@
 #include <vector>
 #include <numeric>
 #include <format>
-#include <deque>
+#include <list>
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
@@ -101,7 +101,7 @@ private:
 };
 
 using OrderPointer = std::unique_ptr<Order>;
-using OrderPointers = std::deque<OrderPointer>;
+using OrderPointers = std::list<OrderPointer>;
 
 class OrderModify {
 public:
@@ -152,8 +152,10 @@ using Trades = std::vector<Trade>;
 
 class Orderbook {
 private:
+    using OrderIterator = OrderPointers::iterator;
+    
     struct OrderEntry {
-        std::size_t index_;
+        OrderIterator iterator_;
         Price price_;
         Side side_;
     };
@@ -161,31 +163,22 @@ private:
     std::map<Price, OrderPointers, std::greater<Price>> bids_;
     std::map<Price, OrderPointers, std::less<Price>> asks_;
     std::unordered_map<OrderId, OrderEntry> orders_;
+    
+    // Incremental volume tracking for O(1) GetOrderInfos
+    std::map<Price, Quantity, std::greater<Price>> bid_volumes_;
+    std::map<Price, Quantity, std::less<Price>> ask_volumes_;
 
-    void UpdateIndicesAfterFrontRemoval(Price price, Side side) {
-        OrderPointers* orders = GetOrdersPointer(price, side);
-        if (!orders) return;
-
-        // After removing front element (index 0), all remaining indices shift down by 1
-        for (std::size_t i = 0; i < orders->size(); ++i) {
-            auto orderId = (*orders)[i]->GetOrderId();
-            auto it = orders_.find(orderId);
-            if (it != orders_.end()) {
-                it->second.index_ = i;
+    // Helper to update volume tracking (incremental updates for O(1) GetOrderInfos)
+    void UpdateVolume(Price price, Side side, Quantity quantity) {
+        if (side == Side::BUY) {
+            bid_volumes_[price] += quantity;
+            if (bid_volumes_[price] <= 0) {
+                bid_volumes_.erase(price);
             }
-        }
-    }
-
-    void UpdateIndicesAfterRemoval(Price price, Side side, std::size_t removedIndex) {
-        OrderPointers* orders = GetOrdersPointer(price, side);
-        if (!orders) return;
-
-        // After removing element at removedIndex, all indices after it shift down by 1
-        for (std::size_t i = removedIndex; i < orders->size(); ++i) {
-            auto orderId = (*orders)[i]->GetOrderId();
-            auto it = orders_.find(orderId);
-            if (it != orders_.end()) {
-                it->second.index_ = i;
+        } else {
+            ask_volumes_[price] += quantity;
+            if (ask_volumes_[price] <= 0) {
+                ask_volumes_.erase(price);
             }
         }
     }
@@ -225,9 +218,11 @@ private:
         if (frontOrder->GetTimeInForce() == TimeInForce::GFD && 
             IsGFDExpired(frontOrder->GetTimestamp(), referenceTimestamp)) {
             OrderId expiredOrderId = frontOrder->GetOrderId();
+            Quantity expiredQty = frontOrder->GetRemainingQuantity();
             orders->pop_front();
             orders_.erase(expiredOrderId);
-            UpdateIndicesAfterFrontRemoval(price, side);
+            // Update volume tracking
+            UpdateVolume(price, side, -expiredQty);
             return true;
         }
         return false;
@@ -340,14 +335,13 @@ private:
                     });
                 }
                 
+                // Update volume tracking (subtract the quantity that was filled)
+                UpdateVolume(levelPrice, oppositeSide, -matchQuantity);
+                
                 // Remove filled order from book
                 if (bookOrder->IsFilled()) {
                     orders_.erase(bookOrderId);
                     levelOrders.pop_front();
-                    
-                    if (!levelOrders.empty()) {
-                        UpdateIndicesAfterFrontRemoval(levelPrice, oppositeSide);
-                    }
                 }
             }
 
@@ -402,18 +396,23 @@ public:
 
         if (shouldAddToBook) {
             // Add remainder to book
-            std::size_t index;
+            OrderIterator it;
+            Quantity remainingQty = order->GetRemainingQuantity();
+            
             if (side == Side::BUY) {
                 auto& orders = bids_[price];
                 orders.push_back(std::move(order));
-                index = orders.size() - 1;
+                it = std::prev(orders.end());
             }
             else {
                 auto& orders = asks_[price];
                 orders.push_back(std::move(order));
-                index = orders.size() - 1;
+                it = std::prev(orders.end());
             }
-            orders_.insert({ orderId, OrderEntry{ index, price, side } });
+            orders_.insert({ orderId, OrderEntry{ it, price, side } });
+            
+            // Update volume tracking
+            UpdateVolume(price, side, remainingQty);
         }
         // Otherwise, order is discarded (fully filled or Market/IOC/FOK with remainder)
 
@@ -427,26 +426,30 @@ public:
         const auto& entry = orders_.at(orderId);
         auto price = entry.price_;
         auto side = entry.side_;
-        auto orderIndex = entry.index_;
+        auto orderIt = entry.iterator_;
+        
+        // Get quantity for volume tracking before erasing
+        Quantity cancelledQty = (*orderIt)->GetRemainingQuantity();
+        
         orders_.erase(orderId);
 
         if (side == Side::SELL) {
             auto& orders = asks_.at(price);
-            orders.erase(orders.begin() + orderIndex);
-            UpdateIndicesAfterRemoval(price, Side::SELL, orderIndex);
+            orders.erase(orderIt);
             if (orders.empty()) {
                 asks_.erase(price);
             }
         }
         else {
             auto& orders = bids_.at(price);
-            orders.erase(orders.begin() + orderIndex);
-            UpdateIndicesAfterRemoval(price, Side::BUY, orderIndex);
+            orders.erase(orderIt);
             if (orders.empty()) {
                 bids_.erase(price);
             }
         }
-
+        
+        // Update volume tracking
+        UpdateVolume(price, side, -cancelledQty);
     }
 
     Trades ModifyOrder(OrderModify order) {
@@ -457,18 +460,10 @@ public:
         const auto& entry = orders_.at(orderId);
         auto price = entry.price_;
         auto side = entry.side_;
-        auto index = entry.index_;
+        auto orderIt = entry.iterator_;
         
-        // Get the existing order from the deque
-        OrderPointer* existingOrderPtr = nullptr;
-        if (side == Side::SELL) {
-            auto& orders = asks_.at(price);
-            existingOrderPtr = &orders[index];
-        } else {
-            auto& orders = bids_.at(price);
-            existingOrderPtr = &orders[index];
-        }
-        auto& existingOrder = *existingOrderPtr;
+        // Get the existing order from the list
+        auto& existingOrder = *orderIt;
 
         // If Price changes OR Quantity increases, we lose priority (Cancel + New).
         if (order.GetPrice() != existingOrder->GetPrice() || 
@@ -480,7 +475,11 @@ public:
 
         // Resizing Down maintains priority
         if (order.GetQuantity() < existingOrder->GetInitialQuantity()) {
+            Quantity oldQty = existingOrder->GetRemainingQuantity();
             existingOrder->ResizeQuantity(order.GetQuantity());
+            Quantity newQty = existingOrder->GetRemainingQuantity();
+            // Update volume tracking for the difference
+            UpdateVolume(price, side, newQty - oldQty);
         }
         return { };
     }
@@ -489,19 +488,15 @@ public:
 
     OrderbookLevelInfos GetOrderInfos() const {
         LevelInfos bidInfos, askInfos;
-        bidInfos.reserve(orders_.size());
-        askInfos.reserve(orders_.size());
+        bidInfos.reserve(bid_volumes_.size());
+        askInfos.reserve(ask_volumes_.size());
 
-        auto CreateLevelInfos = [](Price price, const OrderPointers& orders) {
-            return LevelInfo{ price, std::accumulate(orders.begin(), orders.end(), (Quantity)0, 
-                [](Quantity runningSum, const OrderPointer& order)
-                { return runningSum + order->GetRemainingQuantity();}) };
-        };
-        for (const auto& [price, orders] : bids_) {
-            bidInfos.push_back(CreateLevelInfos(price, orders));
+        // Use incremental volume tracking for O(1) lookup instead of O(N) calculation
+        for (const auto& [price, volume] : bid_volumes_) {
+            bidInfos.push_back(LevelInfo{ price, volume });
         }
-        for (const auto& [price, orders] : asks_) {
-            askInfos.push_back(CreateLevelInfos(price, orders));
+        for (const auto& [price, volume] : ask_volumes_) {
+            askInfos.push_back(LevelInfo{ price, volume });
         }
         return OrderbookLevelInfos{ bidInfos, askInfos };
     }
@@ -517,6 +512,8 @@ public:
         orders_.clear();
         bids_.clear();
         asks_.clear();
+        bid_volumes_.clear();
+        ask_volumes_.clear();
     }
 
 };
