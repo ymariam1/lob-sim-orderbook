@@ -169,17 +169,13 @@ private:
     std::map<Price, Quantity, std::less<Price>> ask_volumes_;
 
     // Helper to update volume tracking (incremental updates for O(1) GetOrderInfos)
-    void UpdateVolume(Price price, Side side, Quantity quantity) {
+void UpdateVolume(Price price, Side side, Quantity delta) {
         if (side == Side::BUY) {
-            bid_volumes_[price] += quantity;
-            if (bid_volumes_[price] <= 0) {
-                bid_volumes_.erase(price);
-            }
+            bid_volumes_[price] += delta;
+            if (bid_volumes_[price] <= 0) bid_volumes_.erase(price);
         } else {
-            ask_volumes_[price] += quantity;
-            if (ask_volumes_[price] <= 0) {
-                ask_volumes_.erase(price);
-            }
+            ask_volumes_[price] += delta;
+            if (ask_volumes_[price] <= 0) ask_volumes_.erase(price);
         }
     }
 
@@ -233,37 +229,33 @@ private:
         Quantity availableQuantity = 0;
         
         if (side == Side::BUY) {
-            if (asks_.empty()) {
+            if (ask_volumes_.empty()) {
                 return false;
             }
-            // For market orders, sum all available asks
-            // For limit orders, sum asks at or below the limit price
-            for (const auto& [askPrice, asks] : asks_) {
+            // For market orders, sum all available ask volumes
+            // For limit orders, sum ask volumes at or below the limit price
+            for (const auto& [askPrice, volume] : ask_volumes_) {
                 if (orderType == OrderType::LIMIT && askPrice > price) {
                     break; // Limit order: can't match above limit price
                 }
-                for (const auto& ask : asks) {
-                    availableQuantity += ask->GetRemainingQuantity();
-                    if (availableQuantity >= quantity) {
-                        return true;
-                    }
+                availableQuantity += volume;
+                if (availableQuantity >= quantity) {
+                    return true;
                 }
             }
         } else { // SELL
-            if (bids_.empty()) {
+            if (bid_volumes_.empty()) {
                 return false;
             }
-            // For market orders, sum all available bids
-            // For limit orders, sum bids at or above the limit price
-            for (const auto& [bidPrice, bids] : bids_) {
+            // For market orders, sum all available bid volumes
+            // For limit orders, sum bid volumes at or above the limit price
+            for (const auto& [bidPrice, volume] : bid_volumes_) {
                 if (orderType == OrderType::LIMIT && bidPrice < price) {
                     break; // Limit order: can't match below limit price
                 }
-                for (const auto& bid : bids) {
-                    availableQuantity += bid->GetRemainingQuantity();
-                    if (availableQuantity >= quantity) {
-                        return true;
-                    }
+                availableQuantity += volume;
+                if (availableQuantity >= quantity) {
+                    return true;
                 }
             }
         }
