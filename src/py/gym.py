@@ -7,19 +7,20 @@ This environment wraps the C++ LOB simulator for reinforcement learning.
 from typing import Optional, Tuple, Dict, Any, Set
 import numpy as np
 
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError:
-    raise ImportError("Please install gymnasium: pip install gymnasium")
+import gymnasium as gym
+from gymnasium import spaces
+import lob_sim as ob
 
+# Import latency model
 try:
-    import lob_sim as ob
+    from src.py.latency import (
+        MarketConditions, AgentLatencyModel, AgentLatencyProfile,
+        create_agent_latency, MarketRegime
+    )
 except ImportError:
-    raise ImportError(
-        "lob_sim module not found. Please build it first:\n"
-        "  cd /path/to/lob-sim-orderbook\n"
-        "  pip install ."
+    from latency import (
+        MarketConditions, AgentLatencyModel, AgentLatencyProfile,
+        create_agent_latency, MarketRegime
     )
 
 
@@ -49,12 +50,17 @@ class LOBEnv(gym.Env):
         self,
         data_path: Optional[str] = None,
         max_levels: int = 10,
-        agent_latency_ns: int = 1_000_000,  # 1ms default
+        agent_latency_ns: int = None,  # Deprecated: use agent_type instead
+        agent_type: str = "institutional",  # "hft", "institutional", "retail", or custom
+        volume_sensitivity: float = 0.1,  # How much volume affects latency
         max_position: int = 100,
         step_duration_ns: int = 10_000_000,  # 10ms per step
         warmup_duration_ns: int = 60_000_000_000,  # 60 seconds to build initial book
         timestamp_unit_ns: int = 1_000_000_000,  # CSV timestamp unit: 1e9 for seconds, 1000 for microseconds
         render_mode: Optional[str] = None,
+        target_qty: int = 100,  # Target quantity to execute per episode
+        execution_side: str = "SELL",  # "BUY" or "SELL" - the side the agent executes
+        latency_seed: Optional[int] = None,  # Seed for reproducible latency
     ):
         """
         Initialize the LOB environment.
@@ -62,7 +68,13 @@ class LOBEnv(gym.Env):
         Args:
             data_path: Path to historical data CSV. If None, uses synthetic seeding.
             max_levels: Number of bid/ask levels to include in observation
-            agent_latency_ns: Simulated network latency in nanoseconds
+            agent_latency_ns: DEPRECATED - use agent_type instead
+            agent_type: Agent latency profile:
+                - "hft": ~0.5ms base (co-located, FPGA)
+                - "institutional": ~10ms base (good infrastructure)
+                - "retail": ~100ms base (consumer internet)
+                - "5.0:0.5": Custom format "base_ms:sigma"
+            volume_sensitivity: How much market volume affects latency (η)
             max_position: Maximum absolute position the agent can hold
             step_duration_ns: How much market time advances per step (default 10ms)
             warmup_duration_ns: How much data to pump at reset to build initial book
@@ -72,17 +84,44 @@ class LOBEnv(gym.Env):
                 - 1000000 for milliseconds
                 - 1000000000 for seconds (default, datagen.py format)
             render_mode: Rendering mode ("human", "ansi", or None)
+            target_qty: Target quantity to execute per episode (for IS reward)
+            execution_side: "BUY" or "SELL" - which side the agent is executing
+            latency_seed: Random seed for reproducible latency sampling
         """
         super().__init__()
         
         self.max_levels = max_levels
-        self.agent_latency_ns = agent_latency_ns
         self.max_position = max_position
         self.step_duration_ns = step_duration_ns
         self.warmup_duration_ns = warmup_duration_ns
         self.timestamp_unit_ns = timestamp_unit_ns
         self.render_mode = render_mode
         self.data_path = data_path
+        self.target_qty = target_qty
+        self.execution_side = ob.Side.BUY if execution_side.upper() == "BUY" else ob.Side.SELL
+        self.agent_type = agent_type
+        self.volume_sensitivity = volume_sensitivity
+        self.latency_seed = latency_seed
+        
+        # Create latency components (separated environment vs agent state)
+        # MarketConditions: Updated ONCE per step (shared by all agents)
+        # AgentLatencyModel: Agent-specific jitter sampling
+        if agent_latency_ns is not None:
+
+            self._market_conditions = None
+            self._agent_latency = None
+            self._fixed_latency_ns = agent_latency_ns
+        else:
+
+            self._market_conditions = MarketConditions(
+                volume_sensitivity=volume_sensitivity,
+                seed=latency_seed,
+            )
+            self._agent_latency = create_agent_latency(
+                agent_type=agent_type,
+                seed=latency_seed + 1 if latency_seed else None,
+            )
+            self._fixed_latency_ns = None
         
         # Initialize orderbook, exchange, and loader
         self._orderbook: Optional[ob.Orderbook] = None
@@ -101,6 +140,17 @@ class LOBEnv(gym.Env):
         # Episode tracking
         self._total_events_at_reset = 0
         
+        # Implementation Shortfall tracking
+        self._arrival_price = 0.0       # Mid price at episode start
+        self._total_qty = 100           # Target quantity to execute (can be configured)
+        self._executed_qty = 0          # Quantity executed so far
+        self._execution_cost = 0.0      # Sum of (price * qty) for all executions
+        self._prev_fills_count = 0      # Track fills processed
+        
+        # Latency tracking
+        self._last_latency_ns = 0       # Last sampled latency
+        self._latency_samples = []      # History of latencies
+        
         # Action space:
         # 0 = Hold
         # 1-5 = Limit Buy at best bid - (0,1,2,3,4) ticks
@@ -110,9 +160,9 @@ class LOBEnv(gym.Env):
         # 13 = Cancel all agent orders
         self.action_space = spaces.Discrete(14)
         
-        # Observation space: [bid_prices, bid_qtys, ask_prices, ask_qtys, position, cash, time, active_orders]
+        # Observation space: [bid_prices, bid_qtys, ask_prices, ask_qtys, position, cash, time, active_orders, progress]
         # Normalized to reasonable ranges
-        obs_dim = max_levels * 4 + 4  # prices + qtys for bids/asks + position + cash + time + active_orders
+        obs_dim = max_levels * 4 + 5  # prices + qtys for bids/asks + position + cash + time + active_orders + progress
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -138,6 +188,19 @@ class LOBEnv(gym.Env):
         self._order_id_counter = 1_000_000
         self._active_orders.clear()
         
+        # Reset Implementation Shortfall tracking
+        self._executed_qty = 0
+        self._execution_cost = 0.0
+        self._prev_fills_count = 0
+        
+        # Reset latency tracking
+        self._last_latency_ns = 0
+        self._latency_samples = []
+        if self._market_conditions is not None:
+            self._market_conditions.reset()
+        if self._agent_latency is not None:
+            self._agent_latency.reset()
+        
         # Initialize data loader or use synthetic seeding
         if self.data_path:
             self._loader = ob.DataLoader(self.data_path, self.timestamp_unit_ns)
@@ -161,8 +224,13 @@ class LOBEnv(gym.Env):
             # Fall back to synthetic seeding if no data path provided
             self._seed_initial_book()
         
+        # Capture arrival price (mid price after warmup)
+        self._arrival_price = self._get_mid_price()
+        self._total_qty = self.target_qty  # Reset target quantity
+        
         obs = self._get_observation()
         info = self._get_info()
+        info["arrival_price"] = self._arrival_price
         
         return obs, info
     
@@ -207,8 +275,6 @@ class LOBEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
-        prev_pnl = self._calculate_pnl()
-        
         # 1. Execute Agent Action (Place Order / Cancel)
         self._execute_action(action)
         
@@ -218,21 +284,46 @@ class LOBEnv(gym.Env):
         if self._loader:
             events_processed = self._loader.PumpToExchange(self._exchange, self.step_duration_ns)
         
-        # 3. Check if episode is over (no more data)
+        # 3. Update market conditions ONCE per step (affects ALL agents equally)
+        # This updates regime (Calm/Stressed) and global congestion
+        if self._market_conditions is not None:
+            volume = events_processed * 10  # Scale events as volume proxy
+            self._market_conditions.update(volume)
+        
+        # 3. Process pending agent actions
+        self._exchange.ProcessPendingAgentActions()
+        
+        # 4. Compute Implementation Shortfall reward from fills
+        step_reward = self._process_fills_for_reward()
+        
+        # 5. Check termination conditions
         terminated = False
         truncated = False
-        if self._loader and not self._loader.HasMoreData():
-            truncated = True  # Episode ends when we run out of data
         
-        # 4. Calculate Reward
-        current_pnl = self._calculate_pnl()
-        reward = current_pnl - prev_pnl
+        # Episode ends when target quantity is fully executed
+        if self._executed_qty >= self._total_qty:
+            terminated = True
+        
+        # Episode truncated when we run out of data
+        if self._loader and not self._loader.HasMoreData():
+            truncated = True
+        
+        # 6. Add terminal penalty for incomplete execution
+        if terminated or truncated:
+            step_reward += self._compute_terminal_penalty()
         
         obs = self._get_observation()
         info = self._get_info()
         info["events_processed"] = events_processed
+        info["executed_qty"] = self._executed_qty
+        info["remaining_qty"] = self._total_qty - self._executed_qty
         
-        return obs, reward, terminated, truncated, info
+        # Compute VWAP if we have executions
+        if self._executed_qty > 0:
+            info["vwap"] = self._execution_cost / self._executed_qty
+            info["slippage_bps"] = abs(info["vwap"] - self._arrival_price) / self._arrival_price * 10000
+        
+        return obs, step_reward, terminated, truncated, info
     
     def _execute_action(self, action: int):
         """Execute the given action."""
@@ -298,7 +389,8 @@ class LOBEnv(gym.Env):
         }
         
         self._order_id_counter += 1
-        self._exchange.PlaceAgentOrder(order, self.agent_latency_ns)
+        latency = self._get_latency()
+        self._exchange.PlaceAgentOrder(order, latency)
     
     def _place_market_order(self, side: ob.Side, qty: int, timestamp: int):
         """Place a market order through the exchange with latency."""
@@ -317,14 +409,38 @@ class LOBEnv(gym.Env):
         # Market orders are not tracked since they execute immediately (after latency)
         # and don't rest on the book
         self._order_id_counter += 1
-        self._exchange.PlaceAgentOrder(order, self.agent_latency_ns)
+        latency = self._get_latency()
+        self._exchange.PlaceAgentOrder(order, latency)
+    
+    def _get_latency(self) -> int:
+        """
+        Get current latency in nanoseconds.
+        
+        Architecture:
+        - MarketConditions provides regime + global congestion (updated once per step)
+        - AgentLatencyModel samples jitter based on agent type and current regime
+        
+        Total Latency = Base + Global_Congestion + Jitter
+        
+        Key insight: HFT has low variance even in stress, Institutional spikes.
+        """
+        if self._agent_latency is not None and self._market_conditions is not None:
+            # Dynamic latency: Agent samples given current market conditions
+            latency = self._agent_latency.sample(self._market_conditions)
+            self._last_latency_ns = latency
+            self._latency_samples.append(latency)
+            return latency
+        else:
+            # Fixed latency (legacy mode)
+            return self._fixed_latency_ns
     
     def _cancel_all_orders(self):
         """Cancel all active agent orders with proper latency simulation."""
+        latency = self._get_latency()
         # Cancel each active order through the exchange (with latency!)
         for order_id in list(self._active_orders.keys()):
             # Use the exchange's cancel method which applies latency
-            self._exchange.CancelAgentOrder(order_id, self.agent_latency_ns)
+            self._exchange.CancelAgentOrder(order_id, latency)
         
         # Clear local tracking (orders are "cancel pending" now)
         # In a more sophisticated implementation, you'd track cancel status
@@ -333,7 +449,8 @@ class LOBEnv(gym.Env):
     def _cancel_order(self, order_id: int):
         """Cancel a single order with latency simulation."""
         if order_id in self._active_orders:
-            self._exchange.CancelAgentOrder(order_id, self.agent_latency_ns)
+            latency = self._get_latency()
+            self._exchange.CancelAgentOrder(order_id, latency)
             del self._active_orders[order_id]
     
     def _get_observation(self) -> np.ndarray:
@@ -359,6 +476,9 @@ class LOBEnv(gym.Env):
         # Normalize (simple scaling - could be improved)
         mid_price = (bid_prices[0] + ask_prices[0]) / 2 if bid_prices[0] > 0 and ask_prices[0] > 0 else 10000
         
+        # Execution progress (0 = not started, 1 = complete)
+        progress = self._executed_qty / self._total_qty if self._total_qty > 0 else 0
+        
         obs = np.concatenate([
             (bid_prices - mid_price) / 100,  # Relative prices
             bid_qtys / 1000,                  # Scaled quantities
@@ -368,6 +488,7 @@ class LOBEnv(gym.Env):
             [self._cash / 10000],                  # Scaled cash
             [self._exchange.GetCurrentTime() / 1e9],  # Time in seconds
             [len(self._active_orders) / 10],  # Normalized active order count
+            [progress],                        # Execution progress (0-1)
         ])
         
         return obs.astype(np.float32)
@@ -382,7 +503,26 @@ class LOBEnv(gym.Env):
             "current_time": self._exchange.GetCurrentTime(),
             "active_orders": len(self._active_orders),
             "pending_actions": self._exchange.GetPendingActionCount(),
+            # Implementation Shortfall metrics
+            "arrival_price": self._arrival_price,
+            "target_qty": self._total_qty,
+            "executed_qty": self._executed_qty,
+            "mid_price": self._get_mid_price(),
+            # Latency info
+            "last_latency_ns": self._last_latency_ns,
+            "last_latency_ms": self._last_latency_ns / 1e6,
         }
+        
+        # Add market conditions and latency statistics
+        if self._market_conditions is not None:
+            info["market_regime"] = self._market_conditions.regime.value
+            info["global_congestion_ms"] = self._market_conditions.global_congestion_ns / 1e6
+            info["current_volume"] = self._market_conditions.current_volume
+        
+        if self._agent_latency is not None and self._latency_samples:
+            samples = np.array(self._latency_samples)
+            info["latency_mean_ms"] = np.mean(samples) / 1e6
+            info["latency_p99_ms"] = np.percentile(samples, 99) / 1e6
         
         # Add loader stats if available
         if self._loader:
@@ -391,18 +531,79 @@ class LOBEnv(gym.Env):
         
         return info
     
-    def _calculate_pnl(self) -> float:
-        """Calculate current P&L (cash + mark-to-market inventory)."""
+    def _get_mid_price(self) -> float:
+        """Get current mid price."""
         book_state = self._orderbook.GetOrderInfos()
         bids = book_state.GetBids()
         asks = book_state.GetAsks()
         
         if bids and asks:
-            mid_price = (bids[0].price + asks[0].price) / 2
-        else:
-            mid_price = 10000  # Fallback
-        
+            return (bids[0].price + asks[0].price) / 2
+        elif bids:
+            return bids[0].price
+        elif asks:
+            return asks[0].price
+        return 10000  # Fallback
+    
+    def _calculate_pnl(self) -> float:
+        """Calculate current P&L (cash + mark-to-market inventory)."""
+        mid_price = self._get_mid_price()
         return self._cash + self._position * mid_price
+    
+    def _process_fills_for_reward(self) -> float:
+        """
+        Process fills from the matching engine and compute step reward.
+        
+        Implementation Shortfall reward:
+        - For sells: reward = -(arrival_price - execution_price) * qty / arrival_price
+        - For buys: reward = -(execution_price - arrival_price) * qty / arrival_price
+        
+        Negative cost = positive reward (we want to minimize cost)
+        """
+        fills = self._exchange.GetAgentFills()
+        step_reward = 0.0
+        
+        for trade in fills:
+            # Get the trade info for our side
+            if self.execution_side == ob.Side.BUY:
+                trade_info = trade.GetBidTrade()
+            else:
+                trade_info = trade.GetAskTrade()
+            
+            price = trade_info.price
+            qty = trade_info.quantity
+            
+            # Update tracking
+            self._executed_qty += qty
+            self._execution_cost += price * qty
+            
+            # Compute step reward (normalized implementation shortfall)
+            if self._arrival_price > 0:
+                if self.execution_side == ob.Side.SELL:
+                    # For sells: higher price = better = positive reward
+                    slippage = (self._arrival_price - price) / self._arrival_price
+                else:
+                    # For buys: lower price = better = positive reward
+                    slippage = (price - self._arrival_price) / self._arrival_price
+                
+                # Negative slippage is good (we beat arrival price)
+                step_reward -= slippage * qty
+        
+        self._exchange.ClearAgentFills()
+        return step_reward
+    
+    def _compute_terminal_penalty(self) -> float:
+        """
+        Compute penalty for unexecuted quantity at episode end.
+        
+        This encourages the agent to complete execution rather than
+        just holding to avoid slippage.
+        """
+        remaining = self._total_qty - self._executed_qty
+        if remaining > 0:
+            # Large penalty for incomplete execution
+            return -10.0 * (remaining / self._total_qty)
+        return 0.0
     
     def render(self):
         """Render the current state."""

@@ -3,4 +3,5 @@ build/*
 *.csv
 *-info
 data/raw*
-
+logs/
+models/
