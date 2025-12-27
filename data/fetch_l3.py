@@ -340,7 +340,7 @@ Note: First day of each month is FREE on Tardis.dev!
             delay=args.delay
         )
         
-        output_csv = args.output or f"blockchain_l3_{args.date}.csv"
+        output_csv = args.output or f"csv/blockchain_l3_{args.date}.csv"
         convert_l3_to_csv(raw_file, output_csv)
         
         print(f"\n{'='*60}")
@@ -348,7 +348,7 @@ Note: First day of each month is FREE on Tardis.dev!
         print(f"{'='*60}")
         print(f"\nTo use in gym.py:")
         print(f"  env = LOBEnv(")
-        print(f"      data_path='data/{output_csv}',")
+        print(f"      data_path='data/csv/{output_csv}',")
         print(f"      timestamp_unit_ns=1000,  # Tardis uses microseconds")
         print(f"  )")
 

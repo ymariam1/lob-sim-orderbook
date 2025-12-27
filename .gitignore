@@ -5,3 +5,5 @@ build/*
 data/raw*
 logs/
 models/
+*/__pycache__/*
+data/csv
