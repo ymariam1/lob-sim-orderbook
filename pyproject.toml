@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lob_sim"
+version = "0.1.0"
+description = "High-frequency Limit Order Book Simulator with Python bindings"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Yohannes Mariam", email = "ymariam@nd.edu"}
+]
+dependencies = [
+    "numpy>=1.20.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "gymnasium>=0.28.0",
+]
+rl = [
+    "gymnasium>=0.28.0",
+    "stable-baselines3>=2.0.0",
+]

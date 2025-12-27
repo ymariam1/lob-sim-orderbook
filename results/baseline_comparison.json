@@ -1,0 +1,35 @@
+{
+  "twap": {
+    "strategy": "TWAP",
+    "total_qty": 1000,
+    "total_time_ns": 3600000000000,
+    "avg_execution_price": 2324926.933333333,
+    "vwap": 2324926.933333333,
+    "arrival_price": 2314559.5,
+    "terminal_price": 2307904.0,
+    "implementation_shortfall": 9952735.999999791,
+    "slippage_bps": 44.79225240627046,
+    "num_fills": 60,
+    "start_time_ns": 1677646860121329000,
+    "end_time_ns": 1677650400121329000
+  },
+  "almgren_chriss": {
+    "strategy": "Almgren-Chriss",
+    "total_qty": 1000,
+    "total_time_ns": 3600000000000,
+    "avg_execution_price": 2315510.023,
+    "vwap": 2315510.023,
+    "arrival_price": 2314559.5,
+    "terminal_price": 2307904.0,
+    "implementation_shortfall": 950523.0000000447,
+    "slippage_bps": 4.106712313941572,
+    "num_fills": 44,
+    "start_time_ns": 1677646860121329000,
+    "end_time_ns": 1677650400121329000
+  },
+  "comparison": {
+    "vwap_diff": -9416.910333333071,
+    "is_diff": -9002212.999999747,
+    "slippage_diff_bps": -40.685540092328885
+  }
+}
