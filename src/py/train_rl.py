@@ -40,6 +40,7 @@ try:
         EvalCallback,
         CheckpointCallback,
         CallbackList,
+        BaseCallback,
     )
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -48,7 +49,101 @@ except ImportError:
     print("  pip install stable-baselines3[extra]")
     sys.exit(1)
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("WARNING: wandb not installed. Enhanced logging disabled.")
+    print("  Install with: pip install wandb")
+
 from src.py.gym import LOBEnv
+
+
+class EpisodeLoggerCallback(BaseCallback):
+    """
+    Custom callback to log detailed episode diagnostics.
+    
+    Tracks:
+    - Execution metrics (slippage, completion rate)
+    - Action distribution
+    - Latency statistics
+    - Market conditions
+    """
+    
+    def __init__(self, verbose=0, log_freq=100):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.episode_count = 0
+        self.episode_data = []
+    
+    def _on_step(self) -> bool:
+        # Check if episode ended
+        if self.locals.get("dones", [False])[0]:
+            self._log_episode()
+        return True
+    
+    def _log_episode(self):
+        """Log detailed episode information."""
+        self.episode_count += 1
+        
+        # Get info from the environment
+        if hasattr(self.training_env, 'get_attr'):
+            try:
+                infos = self.training_env.get_attr('_get_info')
+                if infos and len(infos) > 0:
+                    info = infos[0]()
+                    
+                    episode_metrics = {
+                        'episode/num': self.episode_count,
+                        'episode/executed_qty': info.get('executed_qty', 0),
+                        'episode/target_qty': info.get('target_qty', 0),
+                        'episode/completion_rate': (
+                            info.get('executed_qty', 0) / info.get('target_qty', 1)
+                            if info.get('target_qty', 0) > 0 else 0
+                        ),
+                        'episode/arrival_price': info.get('arrival_price', 0),
+                        'episode/mid_price': info.get('mid_price', 0),
+                        'episode/active_orders': info.get('active_orders', 0),
+                        'episode/pending_actions': info.get('pending_actions', 0),
+                    }
+                    
+                    # Latency metrics
+                    if 'last_latency_ms' in info:
+                        episode_metrics['latency/last_ms'] = info['last_latency_ms']
+                    if 'latency_mean_ms' in info:
+                        episode_metrics['latency/mean_ms'] = info['latency_mean_ms']
+                    if 'latency_p99_ms' in info:
+                        episode_metrics['latency/p99_ms'] = info['latency_p99_ms']
+                    if 'market_regime' in info:
+                        episode_metrics['market/regime'] = 1 if info['market_regime'] == 'stressed' else 0
+                    if 'global_congestion_ms' in info:
+                        episode_metrics['market/congestion_ms'] = info['global_congestion_ms']
+                    
+                    # Calculate slippage if we have VWAP
+                    if 'vwap' in info and 'arrival_price' in info:
+                        vwap = info['vwap']
+                        arrival = info['arrival_price']
+                        if arrival > 0:
+                            slippage_bps = abs(vwap - arrival) / arrival * 10000
+                            episode_metrics['episode/slippage_bps'] = slippage_bps
+                    
+                    self.episode_data.append(episode_metrics)
+                    
+                    # Log to wandb if available
+                    if WANDB_AVAILABLE and wandb.run is not None:
+                        wandb.log(episode_metrics)
+                    
+                    # Print summary every log_freq episodes
+                    if self.episode_count % self.log_freq == 0:
+                        if self.verbose > 0:
+                            print(f"\nEpisode {self.episode_count} Summary:")
+                            print(f"  Completion: {episode_metrics.get('episode/completion_rate', 0):.1%}")
+                            if 'episode/slippage_bps' in episode_metrics:
+                                print(f"  Slippage: {episode_metrics['episode/slippage_bps']:.2f} bps")
+            except Exception as e:
+                if self.verbose > 0:
+                    print(f"Warning: Could not log episode metrics: {e}")
 
 
 def make_env(
@@ -140,6 +235,33 @@ def train(
     run_log_dir = os.path.join(log_dir, run_name)
     os.makedirs(run_log_dir, exist_ok=True)
     
+    # Initialize wandb if available
+    if WANDB_AVAILABLE:
+        # Check if running in sweep mode
+        sweep_id = os.environ.get("WANDB_SWEEP_ID")
+        if sweep_id:
+            wandb.init()
+        else:
+            wandb.init(
+                project="lob-rl",
+                name=run_name,
+                config={
+                    "data_path": data_path,
+                    "total_timesteps": total_timesteps,
+                    "agent_type": agent_type,
+                    "volume_sensitivity": volume_sensitivity,
+                    "target_qty": target_qty,
+                    "execution_side": execution_side,
+                    "learning_rate": learning_rate,
+                    "n_steps": n_steps,
+                    "batch_size": batch_size,
+                    "n_epochs": n_epochs,
+                    "gamma": gamma,
+                    "net_arch": net_arch,
+                },
+                sync_tensorboard=True,
+            )
+    
     print("=" * 60)
     print("LOB RL Training (Implementation Shortfall Reward)")
     print("=" * 60)
@@ -151,6 +273,8 @@ def train(
     print(f"Execution Side: {execution_side}")
     print(f"Network: {net_arch}")
     print(f"Log Dir: {run_log_dir}")
+    if WANDB_AVAILABLE and wandb.run is not None:
+        print(f"WandB: {wandb.run.url}")
     print("=" * 60)
     
     # Create training environment
@@ -203,8 +327,8 @@ def train(
         if os.path.exists(vec_norm_path):
             train_env = VecNormalize.load(vec_norm_path, train_env)
     else:
-        model = PPO(
-            "MlpPolicy",
+model = PPO(
+    "MlpPolicy",
             train_env,
             learning_rate=learning_rate,
             n_steps=n_steps,
@@ -233,7 +357,10 @@ def train(
         deterministic=True,
     )
     
-    callbacks = CallbackList([checkpoint_callback, eval_callback])
+    # Enhanced episode logging
+    episode_logger = EpisodeLoggerCallback(verbose=verbose, log_freq=100)
+    
+    callbacks = CallbackList([checkpoint_callback, eval_callback, episode_logger])
     
     # Train
     print("\nStarting training...")
@@ -409,8 +536,14 @@ def main():
     
     # Misc
     parser.add_argument("--quiet", action="store_true", help="Reduce output")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     
     args = parser.parse_args()
+    
+    # Disable wandb if requested
+    if args.no_wandb:
+        global WANDB_AVAILABLE
+        WANDB_AVAILABLE = False
     
     # Check data exists
     if not os.path.exists(args.data):

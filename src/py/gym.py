@@ -205,22 +205,48 @@ class LOBEnv(gym.Env):
         if self.data_path:
             self._loader = ob.DataLoader(self.data_path, self.timestamp_unit_ns)
             
-            # Auto-warmup: Pump until we reach the first event's timestamp + warmup duration
-            # This handles CSVs that don't start at timestamp 0
+            # Support randomized episode start times
+            # Options can specify: start_time_ns, horizon_ns
+            start_time_ns = None
+            if options and "start_time_ns" in options:
+                start_time_ns = options["start_time_ns"]
+            
+            # Get first event time
             first_event_time_ns = self._loader.PeekNextTimestampNs()
-            target_time_ns = first_event_time_ns + self.warmup_duration_ns
+            
+            if start_time_ns is not None:
+                # Use specified start time
+                # Ensure we have enough warmup before start
+                warmup_start = max(first_event_time_ns, start_time_ns - self.warmup_duration_ns)
+                target_warmup = start_time_ns
+            else:
+                # Default: start after warmup from first event
+                warmup_start = first_event_time_ns
+                target_warmup = first_event_time_ns + self.warmup_duration_ns
             
             if self.render_mode:
-                print(f"First event at {first_event_time_ns / 1e9:.1f}s, warming up to {target_time_ns / 1e9:.1f}s")
+                print(f"Warming up to {target_warmup / 1e9:.1f}s...")
             
-            events_pumped = self._loader.PumpToExchange(self._exchange, target_time_ns)
+            events_pumped = self._loader.PumpToExchange(self._exchange, target_warmup)
             
             if self.render_mode:
                 print(f"Warmup: Pumped {events_pumped} events, book size: {self._orderbook.Size()}")
             
             self._total_events_at_reset = self._loader.GetTotalEventsProcessed()
+            
+            # Store episode start time for horizon tracking
+            self._episode_start_time_ns = self._exchange.GetCurrentTime()
+            
+            # Support variable horizon
+            if options and "horizon_ns" in options:
+                self._episode_horizon_ns = options["horizon_ns"]
+            else:
+                # Default: no horizon limit (episode ends when data runs out)
+                self._episode_horizon_ns = None
         else:
             self._loader = None
+            self._episode_start_time_ns = 0
+            self._episode_horizon_ns = None
             # Fall back to synthetic seeding if no data path provided
             self._seed_initial_book()
         
@@ -307,6 +333,13 @@ class LOBEnv(gym.Env):
         # Episode truncated when we run out of data
         if self._loader and not self._loader.HasMoreData():
             truncated = True
+        
+        # Episode truncated when horizon is reached (if specified)
+        if self._episode_horizon_ns is not None:
+            current_time = self._exchange.GetCurrentTime()
+            elapsed = current_time - self._episode_start_time_ns
+            if elapsed >= self._episode_horizon_ns:
+                truncated = True
         
         # 6. Add terminal penalty for incomplete execution
         if terminated or truncated:

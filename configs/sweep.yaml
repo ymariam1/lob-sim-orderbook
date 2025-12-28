@@ -1,0 +1,72 @@
+# WandB Hyperparameter Sweep Configuration
+# Based on best practices from RL execution papers
+
+program: src/py/train_rl.py
+method: bayes  # Bayesian optimization for efficient search
+metric:
+  name: eval/mean_slippage_bps
+  goal: minimize  # Lower slippage is better
+
+parameters:
+  learning_rate:
+    distribution: log_uniform
+    min: 1e-5
+    max: 1e-3
+    # Common values: [1e-5, 3e-5, 1e-4, 3e-4]
+  
+  n_steps:
+    values: [2048, 4096, 8192]
+    # Larger = more stable but slower
+  
+  batch_size:
+    values: [64, 128, 256]
+    # Larger = more stable gradients
+  
+  n_epochs:
+    values: [5, 10, 20]
+    # More epochs = better sample efficiency
+  
+  ent_coef:
+    distribution: log_uniform
+    min: 0.0
+    max: 0.1
+    # Exploration vs exploitation trade-off
+  
+  clip_range:
+    values: [0.1, 0.2, 0.3]
+    # PPO clipping parameter
+  
+  gamma:
+    values: [0.99, 0.995, 0.999]
+    # Discount factor (higher = more long-term)
+  
+  gae_lambda:
+    values: [0.9, 0.95, 0.99]
+    # GAE lambda (bias-variance trade-off)
+  
+  vf_coef:
+    distribution: uniform
+    min: 0.1
+    max: 1.0
+    # Value function loss coefficient
+  
+  max_grad_norm:
+    values: [0.5, 1.0, 2.0]
+    # Gradient clipping
+
+# Fixed parameters (not swept)
+fixed:
+  data_path: data/csv/blockchain_l3_2023-03-01.csv
+  timesteps: 1000000
+  agent_type: institutional
+  target_qty: 1000
+  execution_side: SELL
+  eval_freq: 50000
+  n_eval_episodes: 5
+
+# Early stopping
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 2
+
