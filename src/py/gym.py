@@ -506,21 +506,36 @@ class LOBEnv(gym.Env):
             ask_prices[i] = level.price
             ask_qtys[i] = level.quantity
         
-        # Normalize (simple scaling - could be improved)
+        # Calculate mid price for relative price normalization
         mid_price = (bid_prices[0] + ask_prices[0]) / 2 if bid_prices[0] > 0 and ask_prices[0] > 0 else 10000
         
         # Execution progress (0 = not started, 1 = complete)
         progress = self._executed_qty / self._total_qty if self._total_qty > 0 else 0
         
+        # NOTE: Observation Scaling Strategy
+        # These scaling factors are initial transformations to bring different features
+        # into similar magnitude ranges. The actual normalization is handled by VecNormalize
+        # during training, which learns running statistics (mean, std) and normalizes
+        # observations accordingly.
+        #
+        # Scaling rationale:
+        # - Prices: Relative to mid_price, divided by 100 to convert to basis points scale
+        # - Quantities: Divided by 1000 to bring typical order sizes (100-10000) to 0.1-10 range
+        # - Cash: Divided by 10000 to scale with typical cash values
+        # - Time: Converted to seconds (nanoseconds / 1e9)
+        # - Active orders: Divided by 10 to normalize typical counts (0-10)
+        #
+        # VecNormalize will learn the actual mean/std during training and apply proper
+        # normalization. These initial scalings just help with numerical stability.
         obs = np.concatenate([
-            (bid_prices - mid_price) / 100,  # Relative prices
-            bid_qtys / 1000,                  # Scaled quantities
-            (ask_prices - mid_price) / 100,
-            ask_qtys / 1000,
-            [self._position / self.max_position],  # Normalized position
-            [self._cash / 10000],                  # Scaled cash
+            (bid_prices - mid_price) / 100,  # Relative prices in basis points scale
+            bid_qtys / 1000,                  # Quantities scaled to typical range
+            (ask_prices - mid_price) / 100,   # Relative prices in basis points scale
+            ask_qtys / 1000,                   # Quantities scaled to typical range
+            [self._position / self.max_position],  # Normalized position (0-1)
+            [self._cash / 10000],                  # Cash scaled to typical range
             [self._exchange.GetCurrentTime() / 1e9],  # Time in seconds
-            [len(self._active_orders) / 10],  # Normalized active order count
+            [len(self._active_orders) / 10],  # Active order count normalized
             [progress],                        # Execution progress (0-1)
         ])
         

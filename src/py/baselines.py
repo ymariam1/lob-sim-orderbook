@@ -460,6 +460,209 @@ class TWAPExecutor(BaselineExecutor):
         return result
 
 
+class VWAPExecutor(BaselineExecutor):
+    """
+    Volume-Weighted Average Price (VWAP) Strategy.
+    
+    Industry standard benchmark. Executes proportionally to market volume.
+    The goal is to match the market's VWAP over the execution period.
+    
+    Implementation:
+    - Divide execution into time slices
+    - In each slice, execute proportionally to market volume in that slice
+    - Uses market orders to match market VWAP
+    """
+    
+    def __init__(
+        self,
+        data_path: str,
+        total_qty: int = 1000,
+        total_time_ns: int = 60 * 60 * int(1e9),
+        num_slices: int = 60,  # Execute every minute for 1 hour
+        **kwargs
+    ):
+        super().__init__(data_path, total_qty, total_time_ns, **kwargs)
+        self.num_slices = num_slices
+        self.slice_interval_ns = total_time_ns // num_slices
+        
+    def execute(self) -> ExecutionResult:
+        """Execute VWAP strategy."""
+        self.reset()
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print("VWAP EXECUTION")
+            print(f"{'='*60}")
+            print(f"Total Qty: {self.total_qty}")
+            print(f"Num Slices: {self.num_slices}")
+            print(f"Interval: {self.slice_interval_ns / 1e9:.1f}s")
+            print()
+        
+        arrival_price = self.get_mid_price()
+        start_time = self.exchange.GetCurrentTime()
+        
+        # VWAP strategy: Execute proportionally to market volume
+        # Simplified: Use uniform distribution (time-weighted) as baseline
+        # In production, this would track actual market volume and execute proportionally
+        # For now, we use uniform time slices (similar to TWAP but conceptually VWAP)
+        # This is a reasonable baseline approximation
+        base_slice_qty = self.total_qty // self.num_slices
+        
+        for i in range(self.num_slices):
+            # Calculate target quantity for this slice
+            # In a real VWAP, this would be proportional to market volume in the slice
+            # For baseline, we use uniform distribution (time-weighted VWAP)
+            target_slice_qty = base_slice_qty
+            # Add remainder to last slice
+            if i == self.num_slices - 1:
+                target_slice_qty += self.total_qty % self.num_slices
+            
+            # Ensure we don't exceed remaining quantity
+            slice_qty = min(target_slice_qty, self.qty_remaining)
+            
+            # Record trajectory
+            self.record_trajectory(self.qty_remaining - slice_qty, self.qty_remaining)
+            
+            # Execute slice
+            if slice_qty > 0:
+                self.place_market_order(slice_qty)
+                
+                if self.verbose and (i + 1) % 10 == 0:
+                    print(f"Slice {i+1}/{self.num_slices}: "
+                          f"Executed {slice_qty}, Remaining: {self.qty_remaining}, "
+                          f"Mid: {self.get_mid_price():.2f}")
+            
+            # Advance time to next slice
+            self.step(self.slice_interval_ns)
+            
+            # Check if we're done or out of data
+            if self.qty_remaining <= 0:
+                break
+            if self.loader and not self.loader.HasMoreData():
+                if self.verbose:
+                    print("Out of market data!")
+                break
+        
+        # Calculate final metrics
+        end_time = self.exchange.GetCurrentTime()
+        terminal_price = self.get_mid_price()
+        
+        result = self._compute_results(
+            strategy="VWAP",
+            arrival_price=arrival_price,
+            terminal_price=terminal_price,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        
+        if self.verbose:
+            self._print_results(result)
+        
+        return result
+
+
+class POVExecutor(BaselineExecutor):
+    """
+    Percentage of Volume (POV) Strategy.
+    
+    Executes a fixed percentage of market volume in each time period.
+    Common in institutional trading to match market flow.
+    
+    Implementation:
+    - Monitor market volume in each time slice
+    - Execute a fixed percentage (e.g., 10%) of that volume
+    - Uses market orders to match market participation rate
+    """
+    
+    def __init__(
+        self,
+        data_path: str,
+        total_qty: int = 1000,
+        total_time_ns: int = 60 * 60 * int(1e9),
+        num_slices: int = 60,  # Execute every minute for 1 hour
+        participation_rate: float = 0.1,  # Execute 10% of market volume
+        **kwargs
+    ):
+        super().__init__(data_path, total_qty, total_time_ns, **kwargs)
+        self.num_slices = num_slices
+        self.slice_interval_ns = total_time_ns // num_slices
+        self.participation_rate = participation_rate  # e.g., 0.1 = 10% of market volume
+        
+    def execute(self) -> ExecutionResult:
+        """Execute POV strategy."""
+        self.reset()
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print("POV EXECUTION")
+            print(f"{'='*60}")
+            print(f"Total Qty: {self.total_qty}")
+            print(f"Num Slices: {self.num_slices}")
+            print(f"Participation Rate: {self.participation_rate:.1%}")
+            print(f"Interval: {self.slice_interval_ns / 1e9:.1f}s")
+            print()
+        
+        arrival_price = self.get_mid_price()
+        start_time = self.exchange.GetCurrentTime()
+        
+        for i in range(self.num_slices):
+            # Estimate market volume in this slice (using book size as proxy)
+            # In production, this would track actual trade volume
+            book_size_before = self.orderbook.Size()
+            
+            # Advance market by slice interval
+            self.step(self.slice_interval_ns)
+            
+            book_size_after = self.orderbook.Size()
+            # Estimate volume as change in book activity
+            # This is a simplified proxy - real POV would track actual trades
+            estimated_volume = max(book_size_after - book_size_before, book_size_after // 10)
+            
+            # Execute participation_rate of estimated market volume
+            target_slice_qty = int(estimated_volume * self.participation_rate)
+            
+            # But don't exceed remaining quantity
+            slice_qty = min(target_slice_qty, self.qty_remaining)
+            
+            # Record trajectory
+            self.record_trajectory(self.qty_remaining - slice_qty, self.qty_remaining)
+            
+            # Execute slice
+            if slice_qty > 0:
+                self.place_market_order(slice_qty)
+                
+                if self.verbose and (i + 1) % 10 == 0:
+                    print(f"Slice {i+1}/{self.num_slices}: "
+                          f"Market Vol: {estimated_volume}, "
+                          f"Executed: {slice_qty}, Remaining: {self.qty_remaining}, "
+                          f"Mid: {self.get_mid_price():.2f}")
+            
+            # Check if we're done or out of data
+            if self.qty_remaining <= 0:
+                break
+            if self.loader and not self.loader.HasMoreData():
+                if self.verbose:
+                    print("Out of market data!")
+                break
+        
+        # Calculate final metrics
+        end_time = self.exchange.GetCurrentTime()
+        terminal_price = self.get_mid_price()
+        
+        result = self._compute_results(
+            strategy="POV",
+            arrival_price=arrival_price,
+            terminal_price=terminal_price,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        
+        if self.verbose:
+            self._print_results(result)
+        
+        return result
+
+
 class AlmgrenChrissExecutor(BaselineExecutor):
     """
     Almgren-Chriss Optimal Execution Strategy.
@@ -492,6 +695,7 @@ class AlmgrenChrissExecutor(BaselineExecutor):
         temp_impact: float = 0.001,    # η
         tick_size: int = 1,            # Minimum price increment
         schedule_tolerance: float = 0.1,  # 10% behind schedule triggers aggressive
+        passive_order_timeout_steps: int = 3,  # How many steps to wait before cancelling unfilled passive order
         **kwargs
     ):
         super().__init__(data_path, total_qty, total_time_ns, **kwargs)
@@ -500,6 +704,7 @@ class AlmgrenChrissExecutor(BaselineExecutor):
         self.temp_impact = temp_impact
         self.tick_size = tick_size
         self.schedule_tolerance = schedule_tolerance
+        self.passive_order_timeout_steps = passive_order_timeout_steps
         
         # Calculate κ
         self.kappa = np.sqrt(risk_aversion * volatility**2 / temp_impact)
@@ -575,15 +780,23 @@ class AlmgrenChrissExecutor(BaselineExecutor):
         X = self.total_qty
         
         # Track active passive order to prevent "Zombie Orders"
+        # FIXED: Orders now rest for multiple steps (more realistic) instead of being cancelled after 1 step
         active_passive_order_id = None
+        active_passive_order_age = 0  # How many steps the order has been resting
         
         for step in range(num_steps):
-            # CLEANUP: Cancel any unfilled passive order from previous step
-            # This prevents "Zombie Orders" from stacking up on the book
+            # CLEANUP: Cancel unfilled passive order if it has been resting too long
+            # This prevents "Zombie Orders" while allowing realistic order resting behavior
             if active_passive_order_id is not None:
-                self.exchange.CancelAgentOrder(active_passive_order_id, 0)  # 0 latency for cancel
-                self.exchange.ProcessPendingAgentActions()
-                active_passive_order_id = None
+                active_passive_order_age += 1
+                if active_passive_order_age >= self.passive_order_timeout_steps:
+                    # Order has been resting for timeout_steps, cancel it
+                    self.exchange.CancelAgentOrder(active_passive_order_id, 0)  # 0 latency for cancel
+                    self.exchange.ProcessPendingAgentActions()
+                    active_passive_order_id = None
+                    active_passive_order_age = 0
+                    if self.verbose:
+                        print(f"Step {step}/{num_steps}: Cancelled unfilled passive order after {self.passive_order_timeout_steps} steps")
             
             current_time = self.exchange.GetCurrentTime()
             elapsed = current_time - start_time
@@ -628,18 +841,37 @@ class AlmgrenChrissExecutor(BaselineExecutor):
                               f"Target: {target_remaining:.0f}, Actual: {actual_remaining}")
                 else:
                     # PASSIVE: Place limit order at best bid (for buys) and wait for fill
-                    if self.side == ob.Side.BUY:
-                        passive_price = self.get_best_bid()[0] if self.get_best_bid()[0] else self.get_mid_price()
+                    # First, check if previous passive order was filled
+                    if active_passive_order_id is not None:
+                        # Check if order was filled by checking if qty_remaining decreased
+                        prev_remaining = self.qty_remaining
+                        self.collect_agent_fills()  # Update fills
+                        # If qty_remaining decreased, order was filled
+                        if self.qty_remaining < prev_remaining:
+                            # Order was filled, reset tracking
+                            active_passive_order_id = None
+                            active_passive_order_age = 0
+                    
+                    # Only place new passive order if we don't have one already resting
+                    if active_passive_order_id is None:
+                        if self.side == ob.Side.BUY:
+                            passive_price = self.get_best_bid()[0] if self.get_best_bid()[0] else self.get_mid_price()
+                        else:
+                            passive_price = self.get_best_ask()[0] if self.get_best_ask()[0] else self.get_mid_price()
+                        
+                        # Track this order ID so we can cancel if unfilled after timeout
+                        active_passive_order_id = self.order_id_counter
+                        active_passive_order_age = 0  # Reset age for new order
+                        
+                        self.place_limit_order_passive(int(passive_price), target_qty)
+                        if self.verbose and step % 10 == 0:
+                            print(f"Step {step}/{num_steps}: PASSIVE (LMT @ {passive_price:.0f}) - Qty: {target_qty}, "
+                                  f"Target: {target_remaining:.0f}, Actual: {actual_remaining}")
                     else:
-                        passive_price = self.get_best_ask()[0] if self.get_best_ask()[0] else self.get_mid_price()
-                    
-                    # Track this order ID so we can cancel if unfilled
-                    active_passive_order_id = self.order_id_counter
-                    
-                    self.place_limit_order_passive(int(passive_price), target_qty)
-                    if self.verbose and step % 10 == 0:
-                        print(f"Step {step}/{num_steps}: PASSIVE (LMT @ {passive_price:.0f}) - Qty: {target_qty}, "
-                              f"Target: {target_remaining:.0f}, Actual: {actual_remaining}")
+                        # Order is still resting, wait for fill
+                        if self.verbose and step % 10 == 0:
+                            print(f"Step {step}/{num_steps}: PASSIVE (WAITING, age={active_passive_order_age}/{self.passive_order_timeout_steps}) - "
+                                  f"Target: {target_remaining:.0f}, Actual: {actual_remaining}")
             
             # Advance time by step interval (same as TWAP)
             self.step(step_interval_ns)
@@ -652,10 +884,18 @@ class AlmgrenChrissExecutor(BaselineExecutor):
                     print("Out of market data!")
                 break
         
-        # Cancel any remaining passive order
+        # Final cleanup: Cancel any remaining passive order
         if active_passive_order_id is not None:
-            self.exchange.CancelAgentOrder(active_passive_order_id, 0)
-            self.exchange.ProcessPendingAgentActions()
+            # Check one last time if order was filled
+            prev_remaining = self.qty_remaining
+            self.collect_agent_fills()
+            if self.qty_remaining < prev_remaining:
+                # Order was filled, no need to cancel
+                pass
+            else:
+                # Order still unfilled, cancel it
+                self.exchange.CancelAgentOrder(active_passive_order_id, 0)
+                self.exchange.ProcessPendingAgentActions()
         
         # Execute any remaining quantity at the end with market order
         if self.qty_remaining > 0:

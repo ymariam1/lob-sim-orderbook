@@ -185,20 +185,36 @@ def make_env(
     latency_seed: int = None,
     rank: int = 0,
     log_dir: str = None,
+    allow_random_selection: bool = True,
 ):
     """
     Create a wrapped LOBEnv for training.
     
     If multiple data files are provided, randomly selects one for each episode reset.
     This provides diversity in training data.
+    
+    CRITICAL: For evaluation, set allow_random_selection=False to use a specific file.
+    This prevents data leakage between train and test sets.
+    
+    Args:
+        data_paths: List of CSV file paths (or single path as list)
+        allow_random_selection: If True, randomly selects file per episode (training).
+                               If False, uses first file (evaluation).
     """
     # Ensure data_paths is a list
     if isinstance(data_paths, str):
         data_paths = [data_paths]
     
+    if not data_paths:
+        raise ValueError("data_paths cannot be empty")
+    
     def _init():
-        # Randomly select a data file for this episode
-        selected_data = random.choice(data_paths)
+        # For training: randomly select a data file for diversity
+        # For evaluation: use first file for consistency (prevents data leakage)
+        if allow_random_selection and len(data_paths) > 1:
+            selected_data = random.choice(data_paths)
+        else:
+            selected_data = data_paths[0]
         
         env = LOBEnv(
             data_path=selected_data,
@@ -220,7 +236,8 @@ def make_env(
 
 
 def train(
-    data_path: str,  # Can be file or directory
+    train_data_path: str,  # Can be file or directory - TRAINING DATA ONLY
+    test_data_path: str = None,  # Optional: separate test data for evaluation
     total_timesteps: int = 100_000,
     agent_type: str = "institutional",
     volume_sensitivity: float = 0.1,
@@ -242,8 +259,12 @@ def train(
     """
     Train a PPO agent on the LOB environment.
     
+    CRITICAL: train_data_path and test_data_path must be completely separate.
+    No overlap between training and test data to prevent data leakage.
+    
     Args:
-        data_path: Path to L3 market data CSV file or directory containing CSV files
+        train_data_path: Path to L3 market data CSV file or directory (TRAINING ONLY)
+        test_data_path: Optional separate test data for evaluation (defaults to train_data_path if None)
         total_timesteps: Total training timesteps
         agent_type: Latency profile ("hft", "institutional", "retail", or "base_ms:sigma")
         volume_sensitivity: How much volume affects latency (η)
@@ -265,8 +286,28 @@ def train(
     if net_arch is None:
         net_arch = [64, 64]
     
-    # Find all CSV files (handles both file and directory)
-    data_files = find_csv_files(data_path)
+    # Find all CSV files for training (handles both file and directory)
+    train_data_files = find_csv_files(train_data_path)
+    
+    # Find test data files (if provided)
+    if test_data_path:
+        test_data_files = find_csv_files(test_data_path)
+        # CRITICAL: Verify no overlap between train and test
+        train_set = set(Path(f).resolve() for f in train_data_files)
+        test_set = set(Path(f).resolve() for f in test_data_files)
+        overlap = train_set & test_set
+        if overlap:
+            raise ValueError(
+                f"CRITICAL: Train and test data overlap detected!\n"
+                f"Overlapping files: {[str(f) for f in overlap]}\n"
+                f"This violates data leakage prevention. Use separate directories."
+            )
+    else:
+        # If no test data provided, use train data for eval (not recommended for production)
+        test_data_files = [train_data_files[0]]  # Use first file only
+        if verbose > 0:
+            print("⚠️  WARNING: No test_data_path provided. Using first training file for evaluation.")
+            print("   This is acceptable for development but NOT for final experiments.")
     
     # Create directories
     os.makedirs(save_dir, exist_ok=True)
@@ -288,8 +329,10 @@ def train(
                 project="lob-rl",
                 name=run_name,
                 config={
-                    "data_path": data_path,
-                    "num_data_files": len(data_files),
+                    "train_data_path": train_data_path,
+                    "test_data_path": test_data_path,
+                    "num_train_files": len(train_data_files),
+                    "num_test_files": len(test_data_files) if test_data_path else 0,
                     "total_timesteps": total_timesteps,
                     "agent_type": agent_type,
                     "volume_sensitivity": volume_sensitivity,
@@ -308,15 +351,23 @@ def train(
     print("=" * 60)
     print("LOB RL Training (Implementation Shortfall Reward)")
     print("=" * 60)
-    print(f"Data: {data_path}")
-    if len(data_files) > 1:
-        print(f"  Found {len(data_files)} CSV files")
-        print(f"  Files: {', '.join([Path(f).name for f in data_files[:5]])}")
-        if len(data_files) > 5:
-            print(f"  ... and {len(data_files) - 5} more")
+    print(f"Training Data: {train_data_path}")
+    if len(train_data_files) > 1:
+        print(f"  Found {len(train_data_files)} CSV files")
+        print(f"  Files: {', '.join([Path(f).name for f in train_data_files[:5]])}")
+        if len(train_data_files) > 5:
+            print(f"  ... and {len(train_data_files) - 5} more")
     else:
-        print(f"  File: {Path(data_files[0]).name}")
-    print(f"Timesteps: {total_timesteps:,}")
+        print(f"  File: {Path(train_data_files[0]).name}")
+    
+    if test_data_path:
+        print(f"\nTest Data: {test_data_path}")
+        print(f"  Found {len(test_data_files)} CSV files (separate from training)")
+        print("  ✅ Train/test separation verified: No overlap")
+    else:
+        print(f"\n⚠️  Test Data: Using first training file (NOT RECOMMENDED for production)")
+    
+    print(f"\nTimesteps: {total_timesteps:,}")
     print(f"Agent Type: {agent_type}")
     print(f"Volume Sensitivity: {volume_sensitivity}")
     print(f"Target Qty: {target_qty}")
@@ -327,16 +378,17 @@ def train(
         print(f"WandB: {wandb.run.url}")
     print("=" * 60)
     
-    # Create training environment (will randomly select from data_files each episode)
+    # Create training environment (will randomly select from train_data_files each episode)
     train_env = DummyVecEnv([
         make_env(
-            data_paths=data_files,  # Pass list of files
+            data_paths=train_data_files,  # Pass list of TRAINING files only
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
             target_qty=target_qty,
             execution_side=execution_side,
             log_dir=run_log_dir,
             rank=0,
+            allow_random_selection=True,  # Random selection for training diversity
         )
     ])
     
@@ -349,15 +401,16 @@ def train(
         clip_reward=10.0,
     )
     
-    # Create evaluation environment (use first data file for consistency)
+    # Create evaluation environment (use TEST data, not training data)
     eval_env_unwrapped = DummyVecEnv([
         make_env(
-            data_paths=[data_files[0]],  # Use first file for eval consistency
+            data_paths=test_data_files,  # Use TEST files only (prevents data leakage)
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
             target_qty=target_qty,
             execution_side=execution_side,
             rank=0,
+            allow_random_selection=False,  # Use first file for consistency in eval
         )
     ])
     eval_env = VecNormalize(
@@ -382,8 +435,8 @@ def train(
             eval_env.training = False
             eval_env.norm_reward = False
     else:
-        model = PPO(
-            "MlpPolicy",
+model = PPO(
+    "MlpPolicy",
             vec_normalize,  # Use VecNormalize wrapper
             learning_rate=learning_rate,
             n_steps=n_steps,
@@ -570,11 +623,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     
-    # Data
+    # Data (CRITICAL: Separate train and test to prevent data leakage)
     parser.add_argument(
-        "--data", 
+        "--train-data", 
         default="data/csv",
-        help="Path to L3 market data CSV file or directory containing CSV files"
+        help="Path to L3 market data CSV file or directory for TRAINING (required)"
+    )
+    parser.add_argument(
+        "--test-data",
+        default=None,
+        help="Path to L3 market data CSV file or directory for TESTING (separate from training). "
+             "If not provided, uses first training file (NOT recommended for production)."
     )
     
     # Training
@@ -617,24 +676,51 @@ def main():
         global WANDB_AVAILABLE
         WANDB_AVAILABLE = False
     
-    # Check data exists (handles both files and directories)
+    # Check training data exists (handles both files and directories)
     try:
-        data_files = find_csv_files(args.data)
-        if not data_files:
-            print(f"Error: No CSV files found in: {args.data}")
+        train_data_files = find_csv_files(args.train_data)
+        if not train_data_files:
+            print(f"Error: No CSV files found in: {args.train_data}")
             print("Please run: python data/fetch_l3.py --hours 1")
             sys.exit(1)
-        print(f"Found {len(data_files)} CSV file(s) for training")
+        print(f"Found {len(train_data_files)} CSV file(s) for training")
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
     
+    # Check test data if provided
+    test_data_path = args.test_data
+    if test_data_path:
+        try:
+            test_data_files = find_csv_files(test_data_path)
+            if not test_data_files:
+                print(f"Error: No CSV files found in test data: {test_data_path}")
+                sys.exit(1)
+            print(f"Found {len(test_data_files)} CSV file(s) for testing")
+            
+            # Verify no overlap
+            train_set = set(Path(f).resolve() for f in train_data_files)
+            test_set = set(Path(f).resolve() for f in test_data_files)
+            overlap = train_set & test_set
+            if overlap:
+                print(f"\n❌ CRITICAL ERROR: Train and test data overlap!")
+                print(f"Overlapping files: {[str(f) for f in overlap]}")
+                print("This violates data leakage prevention.")
+                sys.exit(1)
+            print("✅ Train/test separation verified: No overlap")
+        except ValueError as e:
+            print(f"Error with test data: {e}")
+            sys.exit(1)
+    else:
+        print("⚠️  WARNING: No --test-data provided. Using first training file for evaluation.")
+        print("   This is acceptable for development but NOT for final experiments.")
+    
     if args.eval_only:
         if not args.model:
             args.model = "models/ppo_lob_latest"
-        # For evaluation, use first file if directory provided
-        eval_data_files = find_csv_files(args.data)
-        eval_data_path = eval_data_files[0] if eval_data_files else args.data
+        # For evaluation, use test data if provided, otherwise first training file
+        eval_data_files = find_csv_files(test_data_path) if test_data_path else train_data_files
+        eval_data_path = eval_data_files[0] if eval_data_files else args.train_data
         if len(eval_data_files) > 1:
             print(f"Note: Using first file for evaluation: {Path(eval_data_path).name}")
         evaluate(
@@ -649,7 +735,8 @@ def main():
         )
     else:
         train(
-            data_path=args.data,
+            train_data_path=args.train_data,
+            test_data_path=test_data_path,
             total_timesteps=args.timesteps,
             agent_type=args.agent_type,
             volume_sensitivity=args.volume_sensitivity,

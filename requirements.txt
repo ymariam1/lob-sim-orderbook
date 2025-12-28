@@ -1,0 +1,31 @@
+# Exact versions for reproducibility
+# Generated for lob-sim-orderbook project
+# Python 3.9+
+
+# Core dependencies
+numpy==1.24.3
+scipy==1.10.1
+
+# Reinforcement Learning
+stable-baselines3==2.2.1
+gymnasium==0.29.1
+
+# Machine Learning
+torch==2.0.1
+tensorboard==2.13.0
+
+# Data processing
+pandas==2.0.3
+
+# Visualization
+matplotlib==3.7.2
+
+# Optional: WandB for experiment tracking
+wandb==0.15.8
+
+# Optional: Statistical analysis
+statsmodels==0.14.0
+
+# C++ bindings (built via pybind11)
+# pybind11 is included via CMake/setup.py
+

@@ -175,6 +175,54 @@ def run_twap_baseline(
     return result.slippage_bps  # ExecutionResult is a dataclass, access attribute directly
 
 
+def run_vwap_baseline(
+    data_path: str,
+    start_time_ns: int,
+    horizon_ns: int,
+    target_qty: int,
+    num_slices: int = 60,
+) -> float:
+    """Run VWAP baseline on exact same window."""
+    from src.py.baselines import VWAPExecutor
+    
+    executor = VWAPExecutor(
+        data_path=data_path,
+        total_qty=target_qty,
+        total_time_ns=horizon_ns,
+        num_slices=num_slices,
+        agent_latency_ns=10_000_000,  # 10ms institutional
+        verbose=False,
+    )
+    
+    result = executor.execute()
+    return result.slippage_bps
+
+
+def run_pov_baseline(
+    data_path: str,
+    start_time_ns: int,
+    horizon_ns: int,
+    target_qty: int,
+    participation_rate: float = 0.1,
+    num_slices: int = 60,
+) -> float:
+    """Run POV baseline on exact same window."""
+    from src.py.baselines import POVExecutor
+    
+    executor = POVExecutor(
+        data_path=data_path,
+        total_qty=target_qty,
+        total_time_ns=horizon_ns,
+        num_slices=num_slices,
+        participation_rate=participation_rate,
+        agent_latency_ns=10_000_000,  # 10ms institutional
+        verbose=False,
+    )
+    
+    result = executor.execute()
+    return result.slippage_bps
+
+
 def run_ac_baseline(
     data_path: str,
     start_time_ns: int,
@@ -189,6 +237,7 @@ def run_ac_baseline(
         total_time_ns=horizon_ns,
         risk_aversion=risk_aversion,
         agent_latency_ns=10_000_000,  # 10ms institutional
+        verbose=False,
     )
     
     result = executor.execute()
@@ -371,7 +420,11 @@ def evaluate_agent(
     results = {
         'rl': [],
         'twap': [],
+        'vwap': [],
+        'pov': [],
         'ac': [],
+        'ac_low_risk': [],  # AC with λ=1e-7
+        'ac_high_risk': [],  # AC with λ=1e-5
         'metadata': [],
         'episode_details': [],
     }
@@ -404,7 +457,11 @@ def evaluate_agent(
             
             daily_rl_results = []
             daily_twap_results = []
+            daily_vwap_results = []
+            daily_pov_results = []
             daily_ac_results = []
+            daily_ac_low_risk_results = []  # AC with λ=1e-7 (low risk aversion)
+            daily_ac_high_risk_results = []  # AC with λ=1e-5 (high risk aversion)
             
             # Multiple runs per day with different start times
             # CRITICAL: Each run uses same seed to ensure identical market conditions
@@ -441,12 +498,39 @@ def evaluate_agent(
                     )
                     daily_twap_results.append(twap_slippage)
                     
-                    ac_slippage = run_ac_baseline(
+                    vwap_slippage = run_vwap_baseline(
                         test_day, start_offset_ns, horizon_ns, target_qty
+                    )
+                    daily_vwap_results.append(vwap_slippage)
+                    
+                    pov_slippage = run_pov_baseline(
+                        test_day, start_offset_ns, horizon_ns, target_qty,
+                        participation_rate=0.1
+                    )
+                    daily_pov_results.append(pov_slippage)
+                    
+                    ac_slippage = run_ac_baseline(
+                        test_day, start_offset_ns, horizon_ns, target_qty,
+                        risk_aversion=1e-6  # Default
                     )
                     daily_ac_results.append(ac_slippage)
                     
-                    print(f"RL: {rl_slippage:.2f}bps, TWAP: {twap_slippage:.2f}bps, AC: {ac_slippage:.2f}bps")
+                    ac_low_risk_slippage = run_ac_baseline(
+                        test_day, start_offset_ns, horizon_ns, target_qty,
+                        risk_aversion=1e-7  # Low risk aversion
+                    )
+                    daily_ac_low_risk_results.append(ac_low_risk_slippage)
+                    
+                    ac_high_risk_slippage = run_ac_baseline(
+                        test_day, start_offset_ns, horizon_ns, target_qty,
+                        risk_aversion=1e-5  # High risk aversion
+                    )
+                    daily_ac_high_risk_results.append(ac_high_risk_slippage)
+                    
+                    print(f"RL: {rl_slippage:.2f}bps, TWAP: {twap_slippage:.2f}bps, "
+                          f"VWAP: {vwap_slippage:.2f}bps, POV: {pov_slippage:.2f}bps, "
+                          f"AC: {ac_slippage:.2f}bps, AC(λ=1e-7): {ac_low_risk_slippage:.2f}bps, "
+                          f"AC(λ=1e-5): {ac_high_risk_slippage:.2f}bps")
                     
                     # Store episode details
                     results['episode_details'].append({
@@ -456,7 +540,11 @@ def evaluate_agent(
                         'start_time_ns': start_offset_ns,
                         'rl_slippage_bps': rl_slippage,
                         'twap_slippage_bps': twap_slippage,
+                        'vwap_slippage_bps': vwap_slippage,
+                        'pov_slippage_bps': pov_slippage,
                         'ac_slippage_bps': ac_slippage,
+                        'ac_low_risk_slippage_bps': ac_low_risk_slippage,
+                        'ac_high_risk_slippage_bps': ac_high_risk_slippage,
                         'rl_completion': rl_completion,
                         'rl_reward': rl_info['total_reward'],
                     })
@@ -472,18 +560,30 @@ def evaluate_agent(
             if daily_rl_results:
                 daily_rl_mean = np.mean(daily_rl_results)
                 daily_twap_mean = np.mean(daily_twap_results)
+                daily_vwap_mean = np.mean(daily_vwap_results) if daily_vwap_results else 0
+                daily_pov_mean = np.mean(daily_pov_results) if daily_pov_results else 0
                 daily_ac_mean = np.mean(daily_ac_results)
+                daily_ac_low_risk_mean = np.mean(daily_ac_low_risk_results) if daily_ac_low_risk_results else 0
+                daily_ac_high_risk_mean = np.mean(daily_ac_high_risk_results) if daily_ac_high_risk_results else 0
                 
                 results['rl'].append(daily_rl_mean)
                 results['twap'].append(daily_twap_mean)
+                results['vwap'].append(daily_vwap_mean)
+                results['pov'].append(daily_pov_mean)
                 results['ac'].append(daily_ac_mean)
+                results['ac_low_risk'].append(daily_ac_low_risk_mean)
+                results['ac_high_risk'].append(daily_ac_high_risk_mean)
                 results['metadata'].append({
                     'day': test_day,
                     'horizon_s': horizon_s,
                     'num_runs': num_runs_per_day,
                     'daily_rl_mean_bps': daily_rl_mean,
                     'daily_twap_mean_bps': daily_twap_mean,
+                    'daily_vwap_mean_bps': daily_vwap_mean,
+                    'daily_pov_mean_bps': daily_pov_mean,
                     'daily_ac_mean_bps': daily_ac_mean,
+                    'daily_ac_low_risk_mean_bps': daily_ac_low_risk_mean,
+                    'daily_ac_high_risk_mean_bps': daily_ac_high_risk_mean,
                 })
     
     # Statistical testing
