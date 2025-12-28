@@ -7,3 +7,4 @@ logs/
 models/
 */__pycache__/*
 data/csv
+results/

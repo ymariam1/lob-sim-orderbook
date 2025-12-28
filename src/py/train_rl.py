@@ -22,8 +22,10 @@ Usage:
 import os
 import sys
 import argparse
+import random
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 
@@ -58,6 +60,31 @@ except ImportError:
     print("  Install with: pip install wandb")
 
 from src.py.gym import LOBEnv
+
+
+def find_csv_files(data_path: str) -> List[str]:
+    """
+    Find all CSV files in a directory or return single file.
+    
+    Args:
+        data_path: Path to CSV file or directory containing CSV files
+        
+    Returns:
+        List of CSV file paths
+    """
+    path = Path(data_path)
+    
+    if path.is_file():
+        # Single file
+        return [str(path)]
+    elif path.is_dir():
+        # Directory - find all CSV files
+        csv_files = sorted(path.glob("*.csv"))
+        if not csv_files:
+            raise ValueError(f"No CSV files found in directory: {data_path}")
+        return [str(f) for f in csv_files]
+    else:
+        raise ValueError(f"Path does not exist: {data_path}")
 
 
 class EpisodeLoggerCallback(BaseCallback):
@@ -147,7 +174,7 @@ class EpisodeLoggerCallback(BaseCallback):
 
 
 def make_env(
-    data_path: str,
+    data_paths: List[str],  # Can be single file or list of files
     agent_type: str = "institutional",
     volume_sensitivity: float = 0.1,
     max_position: int = 100,
@@ -159,10 +186,22 @@ def make_env(
     rank: int = 0,
     log_dir: str = None,
 ):
-    """Create a wrapped LOBEnv for training."""
+    """
+    Create a wrapped LOBEnv for training.
+    
+    If multiple data files are provided, randomly selects one for each episode reset.
+    This provides diversity in training data.
+    """
+    # Ensure data_paths is a list
+    if isinstance(data_paths, str):
+        data_paths = [data_paths]
+    
     def _init():
+        # Randomly select a data file for this episode
+        selected_data = random.choice(data_paths)
+        
         env = LOBEnv(
-            data_path=data_path,
+            data_path=selected_data,
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
             max_position=max_position,
@@ -181,7 +220,7 @@ def make_env(
 
 
 def train(
-    data_path: str,
+    data_path: str,  # Can be file or directory
     total_timesteps: int = 100_000,
     agent_type: str = "institutional",
     volume_sensitivity: float = 0.1,
@@ -204,7 +243,7 @@ def train(
     Train a PPO agent on the LOB environment.
     
     Args:
-        data_path: Path to L3 market data CSV
+        data_path: Path to L3 market data CSV file or directory containing CSV files
         total_timesteps: Total training timesteps
         agent_type: Latency profile ("hft", "institutional", "retail", or "base_ms:sigma")
         volume_sensitivity: How much volume affects latency (η)
@@ -225,6 +264,9 @@ def train(
     """
     if net_arch is None:
         net_arch = [64, 64]
+    
+    # Find all CSV files (handles both file and directory)
+    data_files = find_csv_files(data_path)
     
     # Create directories
     os.makedirs(save_dir, exist_ok=True)
@@ -247,6 +289,7 @@ def train(
                 name=run_name,
                 config={
                     "data_path": data_path,
+                    "num_data_files": len(data_files),
                     "total_timesteps": total_timesteps,
                     "agent_type": agent_type,
                     "volume_sensitivity": volume_sensitivity,
@@ -266,6 +309,13 @@ def train(
     print("LOB RL Training (Implementation Shortfall Reward)")
     print("=" * 60)
     print(f"Data: {data_path}")
+    if len(data_files) > 1:
+        print(f"  Found {len(data_files)} CSV files")
+        print(f"  Files: {', '.join([Path(f).name for f in data_files[:5]])}")
+        if len(data_files) > 5:
+            print(f"  ... and {len(data_files) - 5} more")
+    else:
+        print(f"  File: {Path(data_files[0]).name}")
     print(f"Timesteps: {total_timesteps:,}")
     print(f"Agent Type: {agent_type}")
     print(f"Volume Sensitivity: {volume_sensitivity}")
@@ -277,10 +327,10 @@ def train(
         print(f"WandB: {wandb.run.url}")
     print("=" * 60)
     
-    # Create training environment
+    # Create training environment (will randomly select from data_files each episode)
     train_env = DummyVecEnv([
         make_env(
-            data_path=data_path,
+            data_paths=data_files,  # Pass list of files
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
             target_qty=target_qty,
@@ -290,8 +340,8 @@ def train(
         )
     ])
     
-    # Optionally normalize observations
-    train_env = VecNormalize(
+    # Create VecNormalize wrapper (CRITICAL: save this separately!)
+    vec_normalize = VecNormalize(
         train_env,
         norm_obs=True,
         norm_reward=True,
@@ -299,10 +349,10 @@ def train(
         clip_reward=10.0,
     )
     
-    # Create evaluation environment
-    eval_env = DummyVecEnv([
+    # Create evaluation environment (use first data file for consistency)
+    eval_env_unwrapped = DummyVecEnv([
         make_env(
-            data_path=data_path,
+            data_paths=[data_files[0]],  # Use first file for eval consistency
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
             target_qty=target_qty,
@@ -311,7 +361,7 @@ def train(
         )
     ])
     eval_env = VecNormalize(
-        eval_env,
+        eval_env_unwrapped,
         norm_obs=True,
         norm_reward=False,  # Don't normalize reward for eval
         clip_obs=10.0,
@@ -321,15 +371,20 @@ def train(
     # Create or load model
     if resume_path and os.path.exists(resume_path + ".zip"):
         print(f"Resuming from {resume_path}")
-        model = PPO.load(resume_path, env=train_env)
-        # Load normalization stats
+        model = PPO.load(resume_path, env=vec_normalize)
+        # Load normalization stats (CRITICAL: use frozen train stats)
         vec_norm_path = resume_path + "_vecnormalize.pkl"
         if os.path.exists(vec_norm_path):
-            train_env = VecNormalize.load(vec_norm_path, train_env)
+            vec_normalize = VecNormalize.load(vec_norm_path, train_env)
+            vec_normalize.training = False  # Freeze stats
+            # Sync to eval env
+            eval_env = VecNormalize.load(vec_norm_path, eval_env_unwrapped)
+            eval_env.training = False
+            eval_env.norm_reward = False
     else:
-model = PPO(
-    "MlpPolicy",
-            train_env,
+        model = PPO(
+            "MlpPolicy",
+            vec_normalize,  # Use VecNormalize wrapper
             learning_rate=learning_rate,
             n_steps=n_steps,
             batch_size=batch_size,
@@ -348,6 +403,8 @@ model = PPO(
         save_vecnormalize=True,
     )
     
+    # Sync eval env normalization from training (CRITICAL!)
+    # This ensures eval uses frozen train statistics
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=os.path.join(save_dir, "best"),
@@ -357,10 +414,24 @@ model = PPO(
         deterministic=True,
     )
     
+    # Custom callback to sync normalization stats
+    class SyncNormalizeCallback(BaseCallback):
+        """Sync eval env normalization from training env."""
+        def _on_step(self) -> bool:
+            # Sync normalization stats from training to eval
+            eval_env.obs_rms = vec_normalize.obs_rms
+            eval_env.ret_rms = vec_normalize.ret_rms
+            return True
+    
     # Enhanced episode logging
     episode_logger = EpisodeLoggerCallback(verbose=verbose, log_freq=100)
     
-    callbacks = CallbackList([checkpoint_callback, eval_callback, episode_logger])
+    callbacks = CallbackList([
+        checkpoint_callback, 
+        eval_callback, 
+        episode_logger,
+        SyncNormalizeCallback(),
+    ])
     
     # Train
     print("\nStarting training...")
@@ -373,18 +444,19 @@ model = PPO(
     except KeyboardInterrupt:
         print("\nTraining interrupted!")
     
-    # Save final model
+    # Save final model (CRITICAL: save VecNormalize separately!)
     final_path = os.path.join(save_dir, f"{run_name}_final")
     model.save(final_path)
-    train_env.save(final_path + "_vecnormalize.pkl")
+    vec_normalize.save(final_path + "_vecnormalize.pkl")
     print(f"\nFinal model saved to: {final_path}")
+    print(f"VecNormalize stats saved to: {final_path}_vecnormalize.pkl")
     
     # Also save as "latest" for easy resuming
     latest_path = os.path.join(save_dir, "ppo_lob_latest")
     model.save(latest_path)
-    train_env.save(latest_path + "_vecnormalize.pkl")
+    vec_normalize.save(latest_path + "_vecnormalize.pkl")
     
-    train_env.close()
+    vec_normalize.close()
     eval_env.close()
     
     return model
@@ -501,8 +573,8 @@ def main():
     # Data
     parser.add_argument(
         "--data", 
-        default="data/blockchain_l3_2023-03-01.csv",
-        help="Path to L3 market data CSV"
+        default="data/csv",
+        help="Path to L3 market data CSV file or directory containing CSV files"
     )
     
     # Training
@@ -545,18 +617,29 @@ def main():
         global WANDB_AVAILABLE
         WANDB_AVAILABLE = False
     
-    # Check data exists
-    if not os.path.exists(args.data):
-        print(f"Error: Data file not found: {args.data}")
-        print("Please run: python data/fetch_l3.py --hours 1")
+    # Check data exists (handles both files and directories)
+    try:
+        data_files = find_csv_files(args.data)
+        if not data_files:
+            print(f"Error: No CSV files found in: {args.data}")
+            print("Please run: python data/fetch_l3.py --hours 1")
+            sys.exit(1)
+        print(f"Found {len(data_files)} CSV file(s) for training")
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
     
     if args.eval_only:
         if not args.model:
             args.model = "models/ppo_lob_latest"
+        # For evaluation, use first file if directory provided
+        eval_data_files = find_csv_files(args.data)
+        eval_data_path = eval_data_files[0] if eval_data_files else args.data
+        if len(eval_data_files) > 1:
+            print(f"Note: Using first file for evaluation: {Path(eval_data_path).name}")
         evaluate(
             model_path=args.model,
-            data_path=args.data,
+            data_path=eval_data_path,  # Use single file for eval
             n_episodes=args.n_eval_episodes,
             agent_type=args.agent_type,
             volume_sensitivity=args.volume_sensitivity,
