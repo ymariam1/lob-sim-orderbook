@@ -55,7 +55,7 @@ class LOBEnv(gym.Env):
         volume_sensitivity: float = 0.1,  # How much volume affects latency
         max_position: int = 100,
         step_duration_ns: int = 10_000_000,  # 10ms per step
-        warmup_duration_ns: int = 60_000_000_000,  # 60 seconds to build initial book
+        warmup_duration_ns: int = 5_000_000_000,  # 5 seconds to build initial book (was 60)
         timestamp_unit_ns: int = 1_000_000_000,  # CSV timestamp unit: 1e9 for seconds, 1000 for microseconds
         render_mode: Optional[str] = None,
         target_qty: int = 100,  # Target quantity to execute per episode

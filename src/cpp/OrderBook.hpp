@@ -4,7 +4,6 @@
 #include <map>
 #include <vector>
 #include <numeric>
-#include <format>
 #include <list>
 #include <unordered_map>
 #include <memory>
@@ -67,7 +66,7 @@ public:
         bool IsFilled() const { return GetRemainingQuantity() == 0; }
         void Fill(Quantity quantity) {
             if (quantity > GetRemainingQuantity()) {
-                throw std::logic_error(std::format("Cannot fill more than the remaining quantity for order {}", GetOrderId()));
+                throw std::logic_error(std::logic_error("Cannot fill more than the remaining quantity for order " + std::to_string(GetOrderId())));
             }
             filledQuantity_ += quantity;
             remainingQuantity_ -= quantity;
@@ -180,13 +179,14 @@ void UpdateVolume(Price price, Side side, Quantity delta) {
     }
 
     // Check if a GFD order is expired based on a reference timestamp
-    // IMPORTANT: Assumes timestamps are in NANOSECONDS since epoch
-    // DataLoader guarantees all timestamps are converted to nanoseconds
-    // before being passed to the OrderBook via ExchangeSimulator
+    // IMPORTANT: Assumes timestamps are in SECONDS since epoch
+    // If your timestamps are in nanoseconds, use: 86400000000000ULL
+    // If your timestamps are in microseconds, use: 86400000000ULL
+    // If your timestamps are in milliseconds, use: 86400000ULL
     static bool IsGFDExpired(uint64_t orderTimestamp, uint64_t referenceTimestamp) {
-        constexpr uint64_t NANOSECONDS_PER_DAY = 86400000000000ULL;  // 86400 * 1e9
-        uint64_t orderDay = orderTimestamp / NANOSECONDS_PER_DAY;
-        uint64_t referenceDay = referenceTimestamp / NANOSECONDS_PER_DAY;
+        constexpr uint64_t SECONDS_PER_DAY = 86400;
+        uint64_t orderDay = orderTimestamp / SECONDS_PER_DAY;
+        uint64_t referenceDay = referenceTimestamp / SECONDS_PER_DAY;
         return orderDay < referenceDay; // Expired if order is from a previous day
     }
 

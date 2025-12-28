@@ -1,4 +1,4 @@
-build/*
+build/
 .*
 *.csv
 *-info
@@ -8,3 +8,5 @@ models/
 */__pycache__/*
 data/csv
 results/
+*.log
+wandb/
