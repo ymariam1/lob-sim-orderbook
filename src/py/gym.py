@@ -363,35 +363,46 @@ class LOBEnv(gym.Env):
         if action == 0:
             # Hold - do nothing
             return
-        
+
         book_state = self._orderbook.GetOrderInfos()
         bids = book_state.GetBids()
         asks = book_state.GetAsks()
-        
+
         current_time = self._exchange.GetCurrentTime()
-        
+
+        # Calculate adaptive order size based on remaining quantity
+        remaining_qty = self._total_qty - self._executed_qty
+        if remaining_qty <= 0:
+            return  # Nothing left to execute
+
+        # Order size: 10% of remaining, min 1, max 20% of target
+        order_qty = max(1, min(
+            int(remaining_qty * 0.10),  # 10% of remaining
+            int(self._total_qty * 0.20)  # Cap at 20% of target
+        ))
+
         if action <= 5:  # Limit Buy (1-5)
             if not bids:
                 return  # No bids to reference
             best_bid = bids[0].price
             offset = action - 1
             price = best_bid - offset
-            self._place_limit_order(ob.Side.BUY, price, 10, current_time)
-            
+            self._place_limit_order(ob.Side.BUY, price, order_qty, current_time)
+
         elif action <= 10:  # Limit Sell (6-10)
             if not asks:
                 return  # No asks to reference
             best_ask = asks[0].price
             offset = action - 6
             price = best_ask + offset
-            self._place_limit_order(ob.Side.SELL, price, 10, current_time)
-            
+            self._place_limit_order(ob.Side.SELL, price, order_qty, current_time)
+
         elif action == 11:  # Market Buy
-            self._place_market_order(ob.Side.BUY, 10, current_time)
-            
+            self._place_market_order(ob.Side.BUY, order_qty, current_time)
+
         elif action == 12:  # Market Sell
-            self._place_market_order(ob.Side.SELL, 10, current_time)
-            
+            self._place_market_order(ob.Side.SELL, order_qty, current_time)
+
         elif action == 13:  # Cancel all agent orders
             self._cancel_all_orders()
     

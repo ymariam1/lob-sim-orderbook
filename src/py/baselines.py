@@ -499,8 +499,7 @@ class VWAPExecutor(BaselineExecutor):
             print()
         
         arrival_price = self.get_mid_price()
-        start_time = self.exchange.GetCurrentTime()
-        
+
         # VWAP strategy: Execute proportionally to market volume
         # Simplified: Use uniform distribution (time-weighted) as baseline
         # In production, this would track actual market volume and execute proportionally
@@ -544,20 +543,12 @@ class VWAPExecutor(BaselineExecutor):
                 break
         
         # Calculate final metrics
-        end_time = self.exchange.GetCurrentTime()
-        terminal_price = self.get_mid_price()
-        
-        result = self._compute_results(
-            strategy="VWAP",
-            arrival_price=arrival_price,
-            terminal_price=terminal_price,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        
+        result = self.calculate_metrics(arrival_price)
+        result.strategy = "VWAP"
+
         if self.verbose:
-            self._print_results(result)
-        
+            self.print_results(result, "VWAP RESULTS")
+
         return result
 
 
@@ -601,10 +592,9 @@ class POVExecutor(BaselineExecutor):
             print(f"Participation Rate: {self.participation_rate:.1%}")
             print(f"Interval: {self.slice_interval_ns / 1e9:.1f}s")
             print()
-        
+
         arrival_price = self.get_mid_price()
-        start_time = self.exchange.GetCurrentTime()
-        
+
         for i in range(self.num_slices):
             # Estimate market volume in this slice (using book size as proxy)
             # In production, this would track actual trade volume
@@ -646,20 +636,12 @@ class POVExecutor(BaselineExecutor):
                 break
         
         # Calculate final metrics
-        end_time = self.exchange.GetCurrentTime()
-        terminal_price = self.get_mid_price()
-        
-        result = self._compute_results(
-            strategy="POV",
-            arrival_price=arrival_price,
-            terminal_price=terminal_price,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        
+        result = self.calculate_metrics(arrival_price)
+        result.strategy = "POV"
+
         if self.verbose:
-            self._print_results(result)
-        
+            self.print_results(result, "POV RESULTS")
+
         return result
 
 

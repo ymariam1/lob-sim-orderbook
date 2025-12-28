@@ -435,8 +435,8 @@ def train(
             eval_env.training = False
             eval_env.norm_reward = False
     else:
-model = PPO(
-    "MlpPolicy",
+        model = PPO(
+            "MlpPolicy",
             vec_normalize,  # Use VecNormalize wrapper
             learning_rate=learning_rate,
             n_steps=n_steps,
