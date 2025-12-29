@@ -70,9 +70,11 @@ PYBIND11_MODULE(lob_sim, m) {
         });
 
     // -----------------------------------------------------------------------
-    // 3. The Order Class (using smart_holder for unique_ptr transfer in pybind11 3.0+)
+    // 3. The Order Class
+    // Note: For pybind11 2.x compatibility, we avoid smart_holder and unique_ptr
+    // in the Python-facing API. Instead, we use shared_ptr for the Order class.
     // -----------------------------------------------------------------------
-    py::class_<Order, py::smart_holder>(m, "Order")
+    py::class_<Order, std::shared_ptr<Order>>(m, "Order")
         .def(py::init<OrderId, Side, Price, Quantity, uint64_t, int, int>(),
              py::arg("orderId"),
              py::arg("side"),
@@ -116,13 +118,22 @@ PYBIND11_MODULE(lob_sim, m) {
     py::class_<Orderbook, std::shared_ptr<Orderbook>>(m, "Orderbook")
         .def(py::init<>())
         
-        // CRITICAL: Ownership Transfer
-        // We use a lambda to tell Python: "Give me the order, I (C++) will take ownership now."
-        // Once this runs, the Python 'order' object becomes invalid.
-        .def("AddOrder", [](Orderbook& self, std::unique_ptr<Order> order) {
-            return self.AddOrder(std::move(order));
+        // For pybind11 2.x: Accept shared_ptr and convert to unique_ptr internally
+        // We create a copy of the Order to transfer ownership to C++
+        .def("AddOrder", [](Orderbook& self, std::shared_ptr<Order> order) {
+            // Create a new unique_ptr with a copy of the order
+            auto orderCopy = std::make_unique<Order>(
+                order->GetOrderId(),
+                order->GetSide(),
+                order->GetPrice(),
+                order->GetInitialQuantity(),
+                order->GetTimestamp(),
+                order->GetOrderType(),
+                order->GetTimeInForce()
+            );
+            return self.AddOrder(std::move(orderCopy));
         }, py::arg("order"),
-           "Add an order to the book. WARNING: The order object becomes invalid after this call!")
+           "Add an order to the book. Note: A copy of the order is made internally.")
         
         .def("CancelOrder", &Orderbook::CancelOrder, py::arg("orderId"))
         .def("ModifyOrder", &Orderbook::ModifyOrder, py::arg("order"))
@@ -139,16 +150,34 @@ PYBIND11_MODULE(lob_sim, m) {
     py::class_<ExchangeSimulator>(m, "ExchangeSimulator")
         .def(py::init<std::shared_ptr<Orderbook>>(), py::arg("orderbook"))
         
-        // Ownership transfer for placing orders
-        .def("ProcessHistoricalEvent", [](ExchangeSimulator& self, std::unique_ptr<Order> order) {
-            self.ProcessHistoricalEvent(std::move(order));
+        // For pybind11 2.x: Accept shared_ptr and convert to unique_ptr internally
+        .def("ProcessHistoricalEvent", [](ExchangeSimulator& self, std::shared_ptr<Order> order) {
+            auto orderCopy = std::make_unique<Order>(
+                order->GetOrderId(),
+                order->GetSide(),
+                order->GetPrice(),
+                order->GetInitialQuantity(),
+                order->GetTimestamp(),
+                order->GetOrderType(),
+                order->GetTimeInForce()
+            );
+            self.ProcessHistoricalEvent(std::move(orderCopy));
         }, py::arg("order"),
-           "Process a historical market event. WARNING: The order object becomes invalid after this call!")
+           "Process a historical market event. Note: A copy of the order is made internally.")
         
-        .def("PlaceAgentOrder", [](ExchangeSimulator& self, std::unique_ptr<Order> order, uint64_t latency) {
-            self.PlaceAgentOrder(std::move(order), latency);
+        .def("PlaceAgentOrder", [](ExchangeSimulator& self, std::shared_ptr<Order> order, uint64_t latency) {
+            auto orderCopy = std::make_unique<Order>(
+                order->GetOrderId(),
+                order->GetSide(),
+                order->GetPrice(),
+                order->GetInitialQuantity(),
+                order->GetTimestamp(),
+                order->GetOrderType(),
+                order->GetTimeInForce()
+            );
+            self.PlaceAgentOrder(std::move(orderCopy), latency);
         }, py::arg("order"), py::arg("latencyNs"),
-           "Place an agent order with network latency simulation. WARNING: The order object becomes invalid after this call!")
+           "Place an agent order with network latency simulation. Note: A copy of the order is made internally.")
         
         // Cancel with latency simulation
         .def("CancelAgentOrder", &ExchangeSimulator::CancelAgentOrder,
@@ -178,17 +207,18 @@ PYBIND11_MODULE(lob_sim, m) {
 
     // -----------------------------------------------------------------------
     // 6. Helper Factory Functions (Optional but convenient)
+    // For pybind11 2.x: Return shared_ptr instead of unique_ptr
     // -----------------------------------------------------------------------
     m.def("create_limit_order", [](OrderId id, Side side, Price price, Quantity qty, 
                                     uint64_t timestamp, TimeInForce tif) {
-        return std::make_unique<Order>(id, side, price, qty, timestamp, OrderType::LIMIT, tif);
+        return std::make_shared<Order>(id, side, price, qty, timestamp, OrderType::LIMIT, tif);
     }, py::arg("orderId"), py::arg("side"), py::arg("price"), py::arg("quantity"),
        py::arg("timestamp"), py::arg("timeInForce") = TimeInForce::GTC,
        "Create a LIMIT order");
 
     m.def("create_market_order", [](OrderId id, Side side, Quantity qty, 
                                      uint64_t timestamp, TimeInForce tif) {
-        return std::make_unique<Order>(id, side, 0, qty, timestamp, OrderType::MARKET, tif);
+        return std::make_shared<Order>(id, side, 0, qty, timestamp, OrderType::MARKET, tif);
     }, py::arg("orderId"), py::arg("side"), py::arg("quantity"),
        py::arg("timestamp"), py::arg("timeInForce") = TimeInForce::IOC,
        "Create a MARKET order (price is ignored)");

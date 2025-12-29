@@ -59,8 +59,7 @@ statsmodels>=0.13.0
 # ============================================================================
 
 # pybind11 for C++ Python bindings
-# Note: pybind11 3.0+ requires CMake to find Python3 Development component
-# If you have build issues, try pybind11 2.x: pip install "pybind11>=2.10.0,<3.0"
+# Compatible with both 2.x and 3.x
 pybind11>=2.10.0
 
 # CMake is required but must be installed separately:
