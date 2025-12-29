@@ -1,31 +1,82 @@
-# Exact versions for reproducibility
-# Generated for lob-sim-orderbook project
-# Python 3.9+
+# Requirements for lob-sim-orderbook
+# High-frequency Limit Order Book Simulator with Reinforcement Learning
+# Python 3.8+
 
-# Core dependencies
-numpy==1.24.3
-scipy==1.10.1
+# ============================================================================
+# Core Dependencies (Required)
+# ============================================================================
 
-# Reinforcement Learning
-stable-baselines3==2.2.1
-gymnasium==0.29.1
-
-# Machine Learning
-torch==2.0.1
-tensorboard==2.13.0
+# Numerical computing
+numpy>=1.20.0,<2.0
+scipy>=1.9.0
 
 # Data processing
-pandas==2.0.3
+pandas>=1.5.0
 
-# Visualization
-matplotlib==3.7.2
+# ============================================================================
+# Reinforcement Learning (Required for training/evaluation)
+# ============================================================================
 
-# Optional: WandB for experiment tracking
-wandb==0.15.8
+# RL framework
+stable-baselines3[extra]>=2.0.0
+gymnasium>=0.28.0
 
-# Optional: Statistical analysis
-statsmodels==0.14.0
+# PyTorch (dependency of stable-baselines3)
+# Note: Install appropriate version for your system (CPU or CUDA)
+# For CPU: torch>=1.13.0
+# For CUDA: torch>=1.13.0+cu117 (or appropriate CUDA version)
+torch>=1.13.0
 
-# C++ bindings (built via pybind11)
-# pybind11 is included via CMake/setup.py
+# TensorBoard for training visualization
+tensorboard>=2.10.0
+
+# ============================================================================
+# Visualization (Required for plotting/analysis)
+# ============================================================================
+
+matplotlib>=3.5.0
+
+# ============================================================================
+# Statistical Analysis (Required for evaluation)
+# ============================================================================
+
+# For statistical tests (Wilcoxon, bootstrap)
+scikit-learn>=1.0.0
+
+# For multiple testing correction (FDR)
+statsmodels>=0.13.0
+
+# ============================================================================
+# Optional Dependencies
+# ============================================================================
+
+# WandB for experiment tracking (optional but recommended)
+# Uncomment if you want to use WandB:
+# wandb>=0.13.0
+
+# ============================================================================
+# Build Dependencies (Required for building C++ extensions)
+# ============================================================================
+
+# pybind11 for C++ Python bindings
+# Note: This is typically installed via setup.py/pyproject.toml
+# but included here for completeness
+pybind11>=2.10.0
+
+# CMake is required but must be installed separately:
+# - macOS: brew install cmake
+# - Ubuntu/Debian: sudo apt-get install cmake
+# - Windows: Download from https://cmake.org/download/
+
+# ============================================================================
+# Development Dependencies (Optional)
+# ============================================================================
+
+# Testing (uncomment if needed)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+
+# Code formatting (uncomment if needed)
+# black>=22.0.0
+# flake8>=5.0.0
 
