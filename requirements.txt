@@ -1,6 +1,6 @@
 # Requirements for lob-sim-orderbook
 # High-frequency Limit Order Book Simulator with Reinforcement Learning
-# Python 3.8+
+# Python 3.12+
 
 # ============================================================================
 # Core Dependencies (Required)

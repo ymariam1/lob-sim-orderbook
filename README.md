@@ -8,10 +8,14 @@ A high-performance Limit Order Book (LOB) simulator designed for backtesting exe
 
 **System dependencies** (install via package manager):
 - `cmake` (3.15+)
-- `python3-dev` or `python3-devel` (Python development headers)
+- `python3.12-dev` or `python3.12-devel` (Python 3.12 development headers)
 - C++ compiler with C++20 support (GCC 10+ or Clang 10+)
+- Python 3.12 or higher
 
-See [INSTALL.md](INSTALL.md) for detailed installation instructions, especially for SSH/cluster environments.
+For SSH/cluster environments, ensure Python 3.12 development headers are available:
+- Ubuntu/Debian: `sudo apt-get install python3.12-dev`
+- CentOS/RHEL: `sudo yum install python3.12-devel`
+- Or load Python module: `module load python/3.12`
 
 ### Installation
 

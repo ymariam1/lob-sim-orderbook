@@ -68,7 +68,8 @@ class CMakeBuild(build_ext):
         # Explicitly set Python paths if we found them (helps CMake find Python)
         if python_include_dir and os.path.exists(python_include_dir):
             cmake_args.append(f"-DPython3_INCLUDE_DIR={python_include_dir}")
-            message(f"Setting Python3_INCLUDE_DIR={python_include_dir}")
+            if self.verbose:
+                print(f"Setting Python3_INCLUDE_DIR={python_include_dir}")
         if python_lib_dir and os.path.exists(python_lib_dir):
             cmake_args.append(f"-DPython3_LIBRARY_DIR={python_lib_dir}")
         if python_lib and os.path.exists(python_lib):
@@ -108,5 +109,5 @@ setup(
     ext_modules=[CMakeExtension("lob_sim", sourcedir="src/cpp")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
-    python_requires=">=3.8",
+    python_requires=">=3.12",
 )
