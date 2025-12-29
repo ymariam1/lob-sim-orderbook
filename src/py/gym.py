@@ -6,6 +6,8 @@ This environment wraps the C++ LOB simulator for reinforcement learning.
 
 from typing import Optional, Tuple, Dict, Any, Set
 import numpy as np
+import pandas as pd
+import os
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -22,6 +24,74 @@ except ImportError:
         MarketConditions, AgentLatencyModel, AgentLatencyProfile,
         create_agent_latency, MarketRegime
     )
+
+
+def calculate_daily_volume(data_path: str, timestamp_unit_ns: int = 1000) -> float:
+    """
+    Calculate average daily volume from CSV data.
+    
+    This estimates daily volume by:
+    1. Reading a sample of the CSV to estimate total volume
+    2. Calculating the time span
+    3. Extrapolating to daily volume
+    
+    Args:
+        data_path: Path to CSV file
+        timestamp_unit_ns: Conversion factor from CSV timestamp to nanoseconds
+        
+    Returns:
+        Estimated average daily volume (sum of order quantities from ADD events)
+    """
+    try:
+        # Read CSV in chunks to handle large files efficiently
+        chunk_size = 100000
+        total_volume = 0
+        first_timestamp = None
+        last_timestamp = None
+        rows_read = 0
+        max_sample_rows = 500000  # Sample up to 500k rows for speed
+        
+        # Read chunks to estimate volume
+        for chunk in pd.read_csv(data_path, chunksize=chunk_size):
+            if first_timestamp is None:
+                first_timestamp = chunk['timestamp'].iloc[0]
+            
+            # Sum volume from ADD orders (these represent order sizes)
+            # Note: This is an approximation - actual executed volume would require
+            # tracking fills, but ADD order quantities give us a good proxy for market activity
+            add_orders = chunk[chunk['type'] == 'ADD']
+            total_volume += add_orders['qty'].sum()
+            
+            last_timestamp = chunk['timestamp'].iloc[-1]
+            rows_read += len(chunk)
+            
+            # Stop after sampling enough rows
+            if rows_read >= max_sample_rows:
+                break
+        
+        if first_timestamp is None or last_timestamp is None or total_volume == 0:
+            # Fallback: use a default estimate
+            return 100000.0
+        
+        # Calculate time span in days
+        time_span_ns = (last_timestamp - first_timestamp) * timestamp_unit_ns
+        seconds_per_day = 86400
+        nanoseconds_per_day = seconds_per_day * 1e9
+        days_in_sample = time_span_ns / nanoseconds_per_day
+        
+        if days_in_sample <= 0:
+            days_in_sample = 1.0  # At least 1 day
+        
+        # Estimate daily volume from sample
+        # Volume per day = total volume in sample / days in sample
+        estimated_daily_volume = total_volume / days_in_sample
+        
+        return max(1000.0, estimated_daily_volume)  # Minimum 1000 units
+        
+    except Exception as e:
+        # Fallback on error
+        print(f"Warning: Could not calculate daily volume from {data_path}: {e}")
+        return 100000.0  # Default fallback
 
 
 class LOBEnv(gym.Env):
@@ -58,11 +128,12 @@ class LOBEnv(gym.Env):
         warmup_duration_ns: int = 5_000_000_000,  # 5 seconds to build initial book (was 60)
         timestamp_unit_ns: int = 1_000_000_000,  # CSV timestamp unit: 1e9 for seconds, 1000 for microseconds
         render_mode: Optional[str] = None,
-        target_qty: int = 100,  # Target quantity to execute per episode
+        target_qty: Optional[int] = None,  # Target quantity to execute per episode (None = auto from daily volume)
         execution_side: str = "SELL",  # "BUY" or "SELL" - the side the agent executes
         latency_seed: Optional[int] = None,  # Seed for reproducible latency
         inventory_penalty_coef: float = 0.01,  # Penalty coefficient for holding inventory
         max_episode_steps: int = 10000,  # Maximum steps per episode (prevents infinite episodes)
+        target_qty_pct: float = 0.03,  # Percentage of daily volume to use as target (1-5% = 0.01-0.05)
     ):
         """
         Initialize the LOB environment.
@@ -96,6 +167,7 @@ class LOBEnv(gym.Env):
                 - 0.1: Strong urgency - may cause over-aggressive trading
                 - 1.0: Too strong - agent will market-order everything immediately
             max_episode_steps: Maximum steps per episode before truncation (prevents infinite episodes)
+            target_qty_pct: Percentage of daily volume to use as target (default 0.03 = 3%)
         """
         super().__init__()
         
@@ -106,7 +178,20 @@ class LOBEnv(gym.Env):
         self.timestamp_unit_ns = timestamp_unit_ns
         self.render_mode = render_mode
         self.data_path = data_path
-        self.target_qty = target_qty
+        self.target_qty_pct = target_qty_pct
+        
+        # Calculate target_qty from daily volume if not specified
+        if target_qty is None:
+            if data_path and os.path.exists(data_path):
+                daily_volume = calculate_daily_volume(data_path, timestamp_unit_ns)
+                self.target_qty = int(daily_volume * target_qty_pct)
+                if self.render_mode:
+                    print(f"Auto-calculated target_qty: {self.target_qty} ({target_qty_pct*100:.1f}% of daily volume ~{daily_volume:.0f})")
+            else:
+                # Fallback if no data path
+                self.target_qty = 100
+        else:
+            self.target_qty = target_qty
         self.execution_side = ob.Side.BUY if execution_side.upper() == "BUY" else ob.Side.SELL
         self.agent_type = agent_type
         self.volume_sensitivity = volume_sensitivity

@@ -25,7 +25,7 @@ import argparse
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -229,13 +229,14 @@ def make_env(
     max_position: int = 100,
     step_duration_ns: int = 10_000_000,
     warmup_duration_ns: int = 60_000_000_000,
-    target_qty: int = 100,
+    target_qty: Optional[int] = None,  # None = auto from daily volume
     execution_side: str = "SELL",
     latency_seed: int = None,
     rank: int = 0,
     log_dir: str = None,
     allow_random_selection: bool = True,
     inventory_penalty_coef: float = 0.01,
+    target_qty_pct: float = 0.03,  # Percentage of daily volume (1-5% = 0.01-0.05)
 ):
     """
     Create a wrapped LOBEnv for training.
@@ -278,6 +279,7 @@ def make_env(
             execution_side=execution_side,
             latency_seed=latency_seed,
             inventory_penalty_coef=inventory_penalty_coef,
+            target_qty_pct=target_qty_pct,
         )
         # Wrap with Monitor for logging
         if log_dir:
@@ -292,7 +294,7 @@ def train(
     total_timesteps: int = 100_000,
     agent_type: str = "institutional",
     volume_sensitivity: float = 0.1,
-    target_qty: int = 100,
+    target_qty: Optional[int] = None,  # None = auto from daily volume (1-5%)
     execution_side: str = "SELL",
     learning_rate: float = 3e-4,
     n_steps: int = 2048,
@@ -309,6 +311,7 @@ def train(
     verbose: int = 1,
     inventory_penalty_coef: float = 0.01,
     ent_coef: float = 0.0,
+    target_qty_pct: float = 0.03,  # Percentage of daily volume (1-5% = 0.01-0.05)
 ):
     """
     Train a PPO agent on the LOB environment.
@@ -448,6 +451,7 @@ def train(
             rank=0,
             allow_random_selection=True,  # Random selection for training diversity
             inventory_penalty_coef=inventory_penalty_coef,
+            target_qty_pct=target_qty_pct,
         )
     ])
     
@@ -472,6 +476,7 @@ def train(
             rank=0,
             allow_random_selection=False,  # Use first file for consistency in eval
             inventory_penalty_coef=inventory_penalty_coef,
+            target_qty_pct=target_qty_pct,
         )
         env = env_factory()
         # Set max episode steps to prevent infinite episodes during eval
@@ -594,10 +599,11 @@ def evaluate(
     n_episodes: int = 10,
     agent_type: str = "institutional",
     volume_sensitivity: float = 0.1,
-    target_qty: int = 100,
+    target_qty: Optional[int] = None,  # None = auto from daily volume
     execution_side: str = "SELL",
     render: bool = False,
     inventory_penalty_coef: float = 0.01,
+    target_qty_pct: float = 0.03,  # Percentage of daily volume
 ):
     """Evaluate a trained model."""
     print("=" * 60)
@@ -621,6 +627,7 @@ def evaluate(
         execution_side=execution_side,
         render_mode="human" if render else None,
         inventory_penalty_coef=inventory_penalty_coef,
+        target_qty_pct=target_qty_pct,
     )
     
     # Load model
@@ -847,6 +854,7 @@ def main():
             execution_side=args.side,
             render=args.render,
             inventory_penalty_coef=args.inventory_penalty_coef,
+            target_qty_pct=args.target_qty_pct,
         )
     else:
         train(
@@ -871,6 +879,7 @@ def main():
             verbose=0 if args.quiet else 1,
             inventory_penalty_coef=args.inventory_penalty_coef,
             ent_coef=args.ent_coef,
+            target_qty_pct=args.target_qty_pct,
         )
 
 
