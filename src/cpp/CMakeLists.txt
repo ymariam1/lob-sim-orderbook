@@ -5,39 +5,40 @@ project(lob_sim_python)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find Python and pybind11
-# If PYTHON_EXECUTABLE is set (from setup.py), use it to help find Python
+# CRITICAL: For pybind11 3.0+, we MUST find Python3 with Development component
+# BEFORE loading pybind11. This provides python3_add_library command.
+
+# If PYTHON_EXECUTABLE is set (from setup.py), use it
 if(DEFINED PYTHON_EXECUTABLE)
     message(STATUS "Using Python executable: ${PYTHON_EXECUTABLE}")
-    # Set this for pybind11 to use
     set(Python3_EXECUTABLE ${PYTHON_EXECUTABLE})
 endif()
 
-# Try to find Python3 to check for development headers
-find_package(Python3 COMPONENTS Interpreter QUIET)
-
-if(Python3_FOUND AND NOT Python3_INCLUDE_DIRS)
-    # Try to get include directory from Python itself
-    execute_process(
-        COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
-        OUTPUT_VARIABLE Python3_INCLUDE_DIR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-    )
-    if(Python3_INCLUDE_DIR AND EXISTS "${Python3_INCLUDE_DIR}")
-        set(Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIR})
-        message(STATUS "Found Python3 include dir: ${Python3_INCLUDE_DIRS}")
-    endif()
+# Set hints from environment variables if provided
+if(DEFINED Python3_INCLUDE_DIR)
+    set(Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIR})
 endif()
 
-# pybind11 is better at finding Python, especially in virtual environments
-# It will automatically use PYTHON_EXECUTABLE if set, or find Python itself
+# Find Python3 with Development component - REQUIRED for pybind11 3.0+
+# Try Development.Module first (works without full Python library)
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+
+if(NOT Python3_FOUND)
+    # Fall back to full Development (older CMake or missing Development.Module)
+    find_package(Python3 COMPONENTS Interpreter Development QUIET)
+endif()
+
+if(NOT Python3_FOUND)
+    # Last resort: just Interpreter, let pybind11 handle the rest
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    message(WARNING "Python3 Development component not found. Build may fail.")
+endif()
+
+message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
+message(STATUS "Python3 include dirs: ${Python3_INCLUDE_DIRS}")
+
+# Now find pybind11 - it will use the Python3 we just found
 find_package(pybind11 CONFIG REQUIRED)
-
-# If we still don't have Python include dirs, pybind11 should find them
-if(NOT Python3_INCLUDE_DIRS)
-    message(STATUS "Relying on pybind11 to find Python development headers...")
-endif()
 
 # Create the Python Extension Module
 pybind11_add_module(lob_sim bindings.cpp)

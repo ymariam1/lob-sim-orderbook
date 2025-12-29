@@ -86,9 +86,9 @@ class CMakeBuild(build_ext):
         build_temp = Path(self.build_temp) / ext.name
         build_temp.mkdir(parents=True, exist_ok=True)
 
-        # Print CMake args for debugging
-        if self.verbose:
-            print(f"CMake args: {' '.join(cmake_args)}")
+        # Print CMake args for debugging (always print for troubleshooting)
+        print(f"Setting Python3_INCLUDE_DIR={python_include_dir}")
+        print(f"CMake args: {' '.join(cmake_args)}")
 
         subprocess.run(
             ["cmake", ext.sourcedir] + cmake_args,
@@ -109,5 +109,5 @@ setup(
     ext_modules=[CMakeExtension("lob_sim", sourcedir="src/cpp")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
-    python_requires=">=3.12",
+    python_requires=">=3.9",
 )
