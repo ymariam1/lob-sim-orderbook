@@ -87,6 +87,55 @@ def find_csv_files(data_path: str) -> List[str]:
         raise ValueError(f"Path does not exist: {data_path}")
 
 
+class ActionDistributionCallback(BaseCallback):
+    """
+    Diagnostic callback to log action distribution.
+    
+    Helps identify if the agent is stuck on a single action (e.g., "Hold").
+    """
+    
+    def __init__(self, verbose=0, log_freq=1000):
+        super().__init__(verbose)
+        self.log_freq = log_freq
+        self.action_buffer = []
+    
+    def _on_step(self) -> bool:
+        # Collect actions from locals
+        actions = self.locals.get('actions', None)
+        if actions is not None:
+            # Handle different action formats (array, list, scalar)
+            if isinstance(actions, np.ndarray):
+                actions_flat = actions.flatten()
+            elif isinstance(actions, (list, tuple)):
+                actions_flat = np.array(actions).flatten()
+            else:
+                actions_flat = np.array([actions])
+            
+            self.action_buffer.extend(actions_flat.tolist())
+        
+        # Log distribution periodically
+        if self.n_calls % self.log_freq == 0 and len(self.action_buffer) > 0:
+            unique, counts = np.unique(self.action_buffer, return_counts=True)
+            dist = dict(zip(unique.astype(int), counts))
+            total = len(self.action_buffer)
+            dist_pct = {k: (v / total * 100) for k, v in dist.items()}
+            
+            if self.verbose > 0:
+                print(f"\nStep {self.n_calls} action distribution:")
+                for action_id in sorted(dist_pct.keys()):
+                    print(f"  Action {action_id}: {dist_pct[action_id]:.1f}% ({dist[action_id]})")
+            
+            # Log to wandb if available
+            if WANDB_AVAILABLE and wandb.run is not None:
+                for action_id, pct in dist_pct.items():
+                    wandb.log({f"action_dist/action_{action_id}": pct}, commit=False)
+            
+            # Clear buffer
+            self.action_buffer = []
+        
+        return True
+
+
 class EpisodeLoggerCallback(BaseCallback):
     """
     Custom callback to log detailed episode diagnostics.
@@ -186,6 +235,7 @@ def make_env(
     rank: int = 0,
     log_dir: str = None,
     allow_random_selection: bool = True,
+    inventory_penalty_coef: float = 0.01,
 ):
     """
     Create a wrapped LOBEnv for training.
@@ -227,6 +277,7 @@ def make_env(
             target_qty=target_qty,
             execution_side=execution_side,
             latency_seed=latency_seed,
+            inventory_penalty_coef=inventory_penalty_coef,
         )
         # Wrap with Monitor for logging
         if log_dir:
@@ -253,8 +304,11 @@ def train(
     log_dir: str = "logs",
     eval_freq: int = 10000,
     n_eval_episodes: int = 5,
+    max_eval_episode_steps: int = 10000,  # Max steps per eval episode (prevents hangs)
     resume_path: str = None,
     verbose: int = 1,
+    inventory_penalty_coef: float = 0.01,
+    ent_coef: float = 0.0,
 ):
     """
     Train a PPO agent on the LOB environment.
@@ -282,6 +336,8 @@ def train(
         n_eval_episodes: Episodes per evaluation
         resume_path: Path to resume training from
         verbose: Verbosity level
+        inventory_penalty_coef: Penalty coefficient for holding inventory (Almgren-Chriss style, default 0.01)
+        ent_coef: Entropy coefficient for exploration (default 0.0, try 0.01-0.05 if stuck)
     """
     if net_arch is None:
         net_arch = [64, 64]
@@ -344,6 +400,8 @@ def train(
                     "n_epochs": n_epochs,
                     "gamma": gamma,
                     "net_arch": net_arch,
+                    "inventory_penalty_coef": inventory_penalty_coef,
+                    "ent_coef": ent_coef,
                 },
                 sync_tensorboard=True,
             )
@@ -380,7 +438,7 @@ def train(
     
     # Create training environment (will randomly select from train_data_files each episode)
     train_env = DummyVecEnv([
-        make_env(
+            make_env(
             data_paths=train_data_files,  # Pass list of TRAINING files only
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
@@ -389,6 +447,7 @@ def train(
             log_dir=run_log_dir,
             rank=0,
             allow_random_selection=True,  # Random selection for training diversity
+            inventory_penalty_coef=inventory_penalty_coef,
         )
     ])
     
@@ -402,8 +461,9 @@ def train(
     )
     
     # Create evaluation environment (use TEST data, not training data)
-    eval_env_unwrapped = DummyVecEnv([
-        make_env(
+    # Wrap with Monitor for proper metrics reporting (even without log_dir, Monitor tracks metrics)
+    def _make_eval_env():
+        env_factory = make_env(
             data_paths=test_data_files,  # Use TEST files only (prevents data leakage)
             agent_type=agent_type,
             volume_sensitivity=volume_sensitivity,
@@ -411,8 +471,15 @@ def train(
             execution_side=execution_side,
             rank=0,
             allow_random_selection=False,  # Use first file for consistency in eval
+            inventory_penalty_coef=inventory_penalty_coef,
         )
-    ])
+        env = env_factory()
+        # Set max episode steps to prevent infinite episodes during eval
+        env._max_episode_steps = max_eval_episode_steps
+        # Wrap with Monitor for proper metrics reporting (filename=None means no file logging)
+        return Monitor(env, filename=None)
+    
+    eval_env_unwrapped = DummyVecEnv([_make_eval_env])
     eval_env = VecNormalize(
         eval_env_unwrapped,
         norm_obs=True,
@@ -443,6 +510,7 @@ def train(
             batch_size=batch_size,
             n_epochs=n_epochs,
             gamma=gamma,
+            ent_coef=ent_coef,  # Entropy coefficient for exploration
             policy_kwargs=dict(net_arch=net_arch),
             tensorboard_log=run_log_dir,
             verbose=verbose,
@@ -465,6 +533,7 @@ def train(
         eval_freq=eval_freq,
         n_eval_episodes=n_eval_episodes,
         deterministic=True,
+        warn=False,  # Suppress warnings about Monitor wrapper (we already added it)
     )
     
     # Custom callback to sync normalization stats
@@ -479,10 +548,14 @@ def train(
     # Enhanced episode logging
     episode_logger = EpisodeLoggerCallback(verbose=verbose, log_freq=100)
     
+    # Action distribution diagnostic
+    action_dist_callback = ActionDistributionCallback(verbose=verbose, log_freq=1000)
+    
     callbacks = CallbackList([
         checkpoint_callback, 
         eval_callback, 
         episode_logger,
+        action_dist_callback,
         SyncNormalizeCallback(),
     ])
     
@@ -524,6 +597,7 @@ def evaluate(
     target_qty: int = 100,
     execution_side: str = "SELL",
     render: bool = False,
+    inventory_penalty_coef: float = 0.01,
 ):
     """Evaluate a trained model."""
     print("=" * 60)
@@ -546,20 +620,51 @@ def evaluate(
         target_qty=target_qty,
         execution_side=execution_side,
         render_mode="human" if render else None,
+        inventory_penalty_coef=inventory_penalty_coef,
     )
     
     # Load model
     model = PPO.load(model_path)
     
+    # Check if model's observation space matches environment
+    model_obs_shape = model.observation_space.shape
+    env_obs_shape = env.observation_space.shape
+    truncate_obs = False
+    if model_obs_shape != env_obs_shape:
+        print(f"⚠️  Warning: Model observation space shape {model_obs_shape} != environment shape {env_obs_shape}")
+        print(f"   The model was trained with a different observation space.")
+        if env_obs_shape[0] > model_obs_shape[0]:
+            print(f"   Truncating observations from {env_obs_shape[0]} to {model_obs_shape[0]} dimensions.")
+            truncate_obs = True
+        else:
+            print(f"   This will cause errors. Consider retraining the model with the updated environment.")
+            print(f"   Attempting to evaluate anyway...")
+    
     # Load normalization stats if available
     vec_norm_path = model_path + "_vecnormalize.pkl"
-    normalize = os.path.exists(vec_norm_path)
-    if normalize:
-        # We need to wrap in DummyVecEnv for VecNormalize
-        vec_env = DummyVecEnv([lambda: env])
-        vec_env = VecNormalize.load(vec_norm_path, vec_env)
-        vec_env.training = False
-        vec_env.norm_reward = False
+    normalize = False
+    vec_env = None
+    
+    if os.path.exists(vec_norm_path):
+        try:
+            # We need to wrap in DummyVecEnv for VecNormalize
+            vec_env = DummyVecEnv([lambda: env])
+            vec_env = VecNormalize.load(vec_norm_path, vec_env)
+            vec_env.training = False
+            vec_env.norm_reward = False
+            normalize = True
+        except (AssertionError, ValueError) as e:
+            # Handle shape mismatch (e.g., observation space changed)
+            if "shape" in str(e).lower() or "space" in str(e).lower():
+                print(f"⚠️  Warning: VecNormalize stats have incompatible observation space shape.")
+                print(f"   This likely means the environment was updated (e.g., added time_remaining).")
+                print(f"   Evaluating without normalization stats.")
+                if vec_env is not None:
+                    vec_env.close()
+                vec_env = None
+                normalize = False
+            else:
+                raise
     
     episode_rewards = []
     episode_lengths = []
@@ -570,6 +675,9 @@ def evaluate(
             obs = vec_env.reset()
         else:
             obs, _ = env.reset()
+            # Truncate observation if needed to match model's expected input shape
+            if truncate_obs:
+                obs = obs[:model_obs_shape[0]]
         
         done = False
         total_reward = 0
@@ -583,7 +691,9 @@ def evaluate(
                 reward = reward[0]
                 info = info[0]
             else:
-                action, _ = model.predict(obs, deterministic=True)
+                # Truncate observation if needed to match model's expected input shape
+                obs_for_model = obs[:model_obs_shape[0]] if truncate_obs else obs
+                action, _ = model.predict(obs_for_model, deterministic=True)
                 obs, reward, term, trunc, info = env.step(action)
                 done = term or trunc
             
@@ -652,6 +762,10 @@ def main():
                         help="How much volume affects latency (η)")
     parser.add_argument("--target-qty", type=int, default=100, help="Target quantity to execute per episode")
     parser.add_argument("--side", choices=["BUY", "SELL"], default="SELL", help="Execution side")
+    parser.add_argument("--inventory-penalty-coef", type=float, default=0.01,
+                        help="Penalty coefficient for holding inventory (Almgren-Chriss style, default 0.01)")
+    parser.add_argument("--ent-coef", type=float, default=0.0,
+                        help="Entropy coefficient for exploration (default 0.0, try 0.01-0.05 if stuck)")
     
     # Saving/Loading
     parser.add_argument("--save-dir", default="models", help="Model save directory")
@@ -732,6 +846,7 @@ def main():
             target_qty=args.target_qty,
             execution_side=args.side,
             render=args.render,
+            inventory_penalty_coef=args.inventory_penalty_coef,
         )
     else:
         train(
@@ -754,6 +869,8 @@ def main():
             n_eval_episodes=args.n_eval_episodes,
             resume_path=args.resume,
             verbose=0 if args.quiet else 1,
+            inventory_penalty_coef=args.inventory_penalty_coef,
+            ent_coef=args.ent_coef,
         )
 
 

@@ -61,6 +61,8 @@ class LOBEnv(gym.Env):
         target_qty: int = 100,  # Target quantity to execute per episode
         execution_side: str = "SELL",  # "BUY" or "SELL" - the side the agent executes
         latency_seed: Optional[int] = None,  # Seed for reproducible latency
+        inventory_penalty_coef: float = 0.01,  # Penalty coefficient for holding inventory
+        max_episode_steps: int = 10000,  # Maximum steps per episode (prevents infinite episodes)
     ):
         """
         Initialize the LOB environment.
@@ -87,6 +89,13 @@ class LOBEnv(gym.Env):
             target_qty: Target quantity to execute per episode (for IS reward)
             execution_side: "BUY" or "SELL" - which side the agent is executing
             latency_seed: Random seed for reproducible latency sampling
+            inventory_penalty_coef: Penalty coefficient for holding inventory (Almgren-Chriss style).
+                Tuning guide:
+                - 0.001: Very gentle - agent may still not trade enough
+                - 0.01: Good starting point (default)
+                - 0.1: Strong urgency - may cause over-aggressive trading
+                - 1.0: Too strong - agent will market-order everything immediately
+            max_episode_steps: Maximum steps per episode before truncation (prevents infinite episodes)
         """
         super().__init__()
         
@@ -102,6 +111,8 @@ class LOBEnv(gym.Env):
         self.agent_type = agent_type
         self.volume_sensitivity = volume_sensitivity
         self.latency_seed = latency_seed
+        self.inventory_penalty_coef = inventory_penalty_coef
+        self._max_episode_steps = max_episode_steps
         
         # Create latency components (separated environment vs agent state)
         # MarketConditions: Updated ONCE per step (shared by all agents)
@@ -139,6 +150,7 @@ class LOBEnv(gym.Env):
         
         # Episode tracking
         self._total_events_at_reset = 0
+        self._step_count = 0  # Track steps per episode
         
         # Implementation Shortfall tracking
         self._arrival_price = 0.0       # Mid price at episode start
@@ -160,9 +172,9 @@ class LOBEnv(gym.Env):
         # 13 = Cancel all agent orders
         self.action_space = spaces.Discrete(14)
         
-        # Observation space: [bid_prices, bid_qtys, ask_prices, ask_qtys, position, cash, time, active_orders, progress]
+        # Observation space: [bid_prices, bid_qtys, ask_prices, ask_qtys, position, cash, time, active_orders, progress, time_remaining]
         # Normalized to reasonable ranges
-        obs_dim = max_levels * 4 + 5  # prices + qtys for bids/asks + position + cash + time + active_orders + progress
+        obs_dim = max_levels * 4 + 6  # prices + qtys for bids/asks + position + cash + time + active_orders + progress + time_remaining
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -187,6 +199,7 @@ class LOBEnv(gym.Env):
         self._cash = 0.0
         self._order_id_counter = 1_000_000
         self._active_orders.clear()
+        self._step_count = 0  # Reset step counter
         
         # Reset Implementation Shortfall tracking
         self._executed_qty = 0
@@ -319,8 +332,14 @@ class LOBEnv(gym.Env):
         # 3. Process pending agent actions
         self._exchange.ProcessPendingAgentActions()
         
+        # Increment step counter
+        self._step_count += 1
+        
         # 4. Compute Implementation Shortfall reward from fills
         step_reward = self._process_fills_for_reward()
+        
+        # 4.5. Add running inventory penalty (encourages active trading)
+        step_reward += self._compute_inventory_penalty()
         
         # 5. Check termination conditions
         terminated = False
@@ -329,6 +348,10 @@ class LOBEnv(gym.Env):
         # Episode ends when target quantity is fully executed
         if self._executed_qty >= self._total_qty:
             terminated = True
+        
+        # Episode truncated when max steps reached (prevents infinite episodes)
+        if self._step_count >= self._max_episode_steps:
+            truncated = True
         
         # Episode truncated when we run out of data
         if self._loader and not self._loader.HasMoreData():
@@ -523,6 +546,14 @@ class LOBEnv(gym.Env):
         # Execution progress (0 = not started, 1 = complete)
         progress = self._executed_qty / self._total_qty if self._total_qty > 0 else 0
         
+        # Time remaining (0 = deadline, 1 = just started)
+        if self._episode_horizon_ns is not None and self._episode_horizon_ns > 0:
+            current_time = self._exchange.GetCurrentTime()
+            elapsed = current_time - self._episode_start_time_ns
+            time_remaining = max(0.0, 1.0 - elapsed / self._episode_horizon_ns)
+        else:
+            time_remaining = 1.0  # No horizon limit
+        
         # NOTE: Observation Scaling Strategy
         # These scaling factors are initial transformations to bring different features
         # into similar magnitude ranges. The actual normalization is handled by VecNormalize
@@ -548,6 +579,7 @@ class LOBEnv(gym.Env):
             [self._exchange.GetCurrentTime() / 1e9],  # Time in seconds
             [len(self._active_orders) / 10],  # Active order count normalized
             [progress],                        # Execution progress (0-1)
+            [time_remaining],                  # Time remaining (0-1)
         ])
         
         return obs.astype(np.float32)
@@ -650,6 +682,51 @@ class LOBEnv(gym.Env):
         
         self._exchange.ClearAgentFills()
         return step_reward
+    
+    def _compute_inventory_penalty(self) -> float:
+        """
+        Compute running penalty for holding inventory using Almgren-Chriss style.
+        
+        This encourages the agent to actively trade rather than holding.
+        Uses Almgren-Chriss quadratic penalty: λ * σ² * q²
+        """
+        return self._compute_inventory_penalty_ac_style()
+    
+    def _compute_inventory_penalty_ac_style(self) -> float:
+        """
+        Almgren-Chriss style running penalty.
+        
+        Cost = λ * σ² * q² where q = remaining inventory
+        
+        This penalizes variance risk from holding inventory.
+        """
+        remaining = self._total_qty - self._executed_qty
+        if remaining <= 0:
+            return 0.0
+        
+        # Risk aversion parameter (matches A-C baseline)
+        lambda_risk = 1e-6  # Same as A-C default
+        
+        # Estimate price variance (could use actual data)
+        # For now, use a proxy based on spread
+        book_state = self._orderbook.GetOrderInfos()
+        bids = book_state.GetBids()
+        asks = book_state.GetAsks()
+        
+        if bids and asks:
+            spread = asks[0].price - bids[0].price
+            sigma_sq = (spread / 2) ** 2  # Rough variance proxy
+        else:
+            sigma_sq = 1.0  # Fallback
+        
+        # Quadratic inventory penalty
+        penalty = -lambda_risk * sigma_sq * (remaining ** 2)
+        
+        # Scale to reasonable range (the raw value may be tiny or huge)
+        penalty = penalty / (self._total_qty ** 2)  # Normalize by target
+        
+        # Apply coefficient scaling
+        return penalty * self.inventory_penalty_coef * 100  # Scale factor (tune this)
     
     def _compute_terminal_penalty(self) -> float:
         """
