@@ -2,20 +2,23 @@
 
 A high-performance Limit Order Book (LOB) simulator designed for backtesting execution algorithms and training reinforcement learning agents. Features realistic latency simulation, real L3 market data support, and Python bindings for easy integration.
 
-## Features
-
-- **C++ Core**: High-performance matching engine with price-time priority
-- **Realistic Latency**: Stochastic latency simulation with market regime detection (HFT/Institutional/Retail profiles)
-- **L3 Market Data**: Support for real historical order book data (Tardis.dev format)
-- **RL Environment**: Gymnasium-compatible environment for training execution agents
-- **Implementation Shortfall**: Reward function based on IS minimization
-- **Adaptive Order Sizing**: Dynamic order sizing (10% remaining, capped at 20% of target)
-- **Inventory Penalties**: Almgren-Chriss style penalties to encourage active trading
-- **Baseline Algorithms**: VWAP, POV, and Almgren-Chriss optimal execution
-
 ## Quick Start
 
+### Prerequisites
+
+**System dependencies** (install via package manager):
+- `cmake` (3.15+)
+- `python3-dev` or `python3-devel` (Python development headers)
+- C++ compiler with C++20 support (GCC 10+ or Clang 10+)
+
+See [INSTALL.md](INSTALL.md) for detailed installation instructions, especially for SSH/cluster environments.
+
+### Installation
+
 ```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
 # Install the Python package (builds C++ automatically)
 pip install .
 
@@ -48,6 +51,7 @@ python src/py/train_rl.py \
 ```
 
 Key arguments:
+
 - `--train-data`: Directory containing training CSV files
 - `--test-data`: Directory containing test CSV files (separate from training)
 - `--timesteps`: Total training timesteps (default: 100k)
@@ -104,6 +108,7 @@ lob-sim-orderbook/
 ## RL Environment Details
 
 ### Action Space (Discrete 14)
+
 - **0**: Hold (do nothing)
 - **1-5**: Limit Buy at best bid - (0,1,2,3,4) ticks
 - **6-10**: Limit Sell at best ask + (0,1,2,3,4) ticks
@@ -112,6 +117,7 @@ lob-sim-orderbook/
 - **13**: Cancel all active orders
 
 ### Observation Space
+
 - Bid/Ask prices and quantities (10 levels each)
 - Current position
 - Realized P&L (cash)
@@ -121,6 +127,7 @@ lob-sim-orderbook/
 - Time remaining (if horizon specified)
 
 ### Reward Function (Implementation Shortfall)
+
 The agent is rewarded based on minimizing slippage relative to the arrival price:
 
 ```
@@ -129,20 +136,13 @@ where slippage = (execution_price - arrival_price) / arrival_price
 ```
 
 Additionally:
+
 - **Inventory penalty**: Almgren-Chriss style quadratic penalty for holding inventory (encourages completion)
 - **Terminal penalty**: Large penalty for incomplete execution at episode end
 
 ### Key Parameters
+
 - `warmup_duration_ns`: 5 seconds (builds initial order book state)
 - `step_duration_ns`: 10ms per step
 - `max_episode_steps`: 10,000 (prevents infinite episodes)
 - `inventory_penalty_coef`: 0.01 (tunable urgency parameter)
-
-## Recent Improvements
-
-1. **Fixed Adaptive Order Sizing** (gym.py:361-407): Orders are now 10% of remaining quantity, capped at 20% of target
-2. **Fixed Timestamp Units** (OrderBook.hpp:182-192): GFD expiration now uses nanoseconds instead of seconds
-3. **Fixed Baseline Methods** (baselines.py): VWAP and POV now use correct `calculate_metrics()` and `print_results()`
-4. **Inventory Penalties**: Added running penalty to encourage active trading rather than passive holding
-5. **Max Episode Steps**: Prevents infinite episodes when agent learns to avoid trading
-6. **Train/Test Split**: Proper data separation to prevent leakage and enable valid evaluation

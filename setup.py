@@ -35,6 +35,28 @@ class CMakeBuild(build_ext):
         # Get pybind11 cmake dir
         import pybind11
         pybind11_cmake_dir = pybind11.get_cmake_dir()
+        
+        # Get Python include and library directories
+        import sysconfig
+        python_include_dir = sysconfig.get_path('include')
+        python_lib_dir = sysconfig.get_config_var('LIBDIR')
+        
+        # Try to find Python library
+        python_lib = None
+        if python_lib_dir:
+            import glob
+            python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            # Common library naming patterns
+            lib_patterns = [
+                f"{python_lib_dir}/libpython{python_version}*.so",
+                f"{python_lib_dir}/libpython{python_version}*.a",
+                f"{python_lib_dir}/libpython{sys.version_info.major}{sys.version_info.minor}*.so",
+            ]
+            for pattern in lib_patterns:
+                matches = glob.glob(pattern)
+                if matches:
+                    python_lib = matches[0]
+                    break
 
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
@@ -42,6 +64,15 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_BUILD_TYPE={cfg}",
             f"-Dpybind11_DIR={pybind11_cmake_dir}",
         ]
+        
+        # Explicitly set Python paths if we found them (helps CMake find Python)
+        if python_include_dir and os.path.exists(python_include_dir):
+            cmake_args.append(f"-DPython3_INCLUDE_DIR={python_include_dir}")
+            message(f"Setting Python3_INCLUDE_DIR={python_include_dir}")
+        if python_lib_dir and os.path.exists(python_lib_dir):
+            cmake_args.append(f"-DPython3_LIBRARY_DIR={python_lib_dir}")
+        if python_lib and os.path.exists(python_lib):
+            cmake_args.append(f"-DPython3_LIBRARY={python_lib}")
 
         build_args = ["--config", cfg]
 
@@ -53,6 +84,10 @@ class CMakeBuild(build_ext):
 
         build_temp = Path(self.build_temp) / ext.name
         build_temp.mkdir(parents=True, exist_ok=True)
+
+        # Print CMake args for debugging
+        if self.verbose:
+            print(f"CMake args: {' '.join(cmake_args)}")
 
         subprocess.run(
             ["cmake", ext.sourcedir] + cmake_args,
