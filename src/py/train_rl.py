@@ -767,7 +767,10 @@ def main():
                         help="Latency profile: 'hft', 'institutional', 'retail', or 'base_ms:sigma'")
     parser.add_argument("--volume-sensitivity", type=float, default=0.1,
                         help="How much volume affects latency (η)")
-    parser.add_argument("--target-qty", type=int, default=100, help="Target quantity to execute per episode")
+    parser.add_argument("--target-qty", type=int, default=None, 
+                        help="Target quantity to execute per episode (if None, calculated from target-qty-pct)")
+    parser.add_argument("--target-qty-pct", type=float, default=0.03,
+                        help="Target quantity as percentage of daily volume (default 0.03 = 3%%, range 0.01-0.05)")
     parser.add_argument("--side", choices=["BUY", "SELL"], default="SELL", help="Execution side")
     parser.add_argument("--inventory-penalty-coef", type=float, default=0.01,
                         help="Penalty coefficient for holding inventory (Almgren-Chriss style, default 0.01)")
