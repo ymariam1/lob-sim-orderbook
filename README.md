@@ -136,6 +136,25 @@ To save disk space, only the **best model** (based on evaluation performance) is
 
 Intermediate checkpoints are NOT saved. If you need more frequent checkpoints, modify the `EvalCallback` frequency in `train_rl.py`.
 
+### Debugging Training Issues
+
+If your model isn't learning (stuck on "Hold", low completion rates), use the diagnostic script:
+
+```bash
+python diagnose_model.py \
+  --model models/best/best_model \
+  --data data/test/blockchain_l3_2023-03-01.csv \
+  --n-episodes 10
+```
+
+This will show:
+- Action distribution (is agent stuck on Hold?)
+- Reward patterns
+- Execution completion rates
+- Recommendations for fixing issues
+
+See `TRAINING_FIXES.md` for details on recent improvements to training stability.
+
 ## Project Structure
 
 ```

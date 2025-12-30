@@ -131,7 +131,7 @@ class LOBEnv(gym.Env):
         target_qty: Optional[int] = None,  # Target quantity to execute per episode (None = auto from daily volume)
         execution_side: str = "SELL",  # "BUY" or "SELL" - the side the agent executes
         latency_seed: Optional[int] = None,  # Seed for reproducible latency
-        inventory_penalty_coef: float = 0.01,  # Penalty coefficient for holding inventory
+        inventory_penalty_coef: float = 1.0,  # Penalty coefficient for holding inventory (INCREASED from 0.01)
         max_episode_steps: int = 10000,  # Maximum steps per episode (prevents infinite episodes)
         target_qty_pct: float = 0.03,  # Percentage of daily volume to use as target (1-5% = 0.01-0.05)
     ):
@@ -160,12 +160,12 @@ class LOBEnv(gym.Env):
             target_qty: Target quantity to execute per episode (for IS reward)
             execution_side: "BUY" or "SELL" - which side the agent is executing
             latency_seed: Random seed for reproducible latency sampling
-            inventory_penalty_coef: Penalty coefficient for holding inventory (Almgren-Chriss style).
+            inventory_penalty_coef: Penalty coefficient for holding inventory (simplified linear).
                 Tuning guide:
-                - 0.001: Very gentle - agent may still not trade enough
-                - 0.01: Good starting point (default)
-                - 0.1: Strong urgency - may cause over-aggressive trading
-                - 1.0: Too strong - agent will market-order everything immediately
+                - 0.1: Very gentle - agent may still not trade enough
+                - 1.0: Good starting point (NEW DEFAULT) - encourages active trading
+                - 5.0: Strong urgency - may cause over-aggressive trading
+                - 10.0: Very strong - agent will prioritize speed over price
             max_episode_steps: Maximum steps per episode before truncation (prevents infinite episodes)
             target_qty_pct: Percentage of daily volume to use as target (default 0.03 = 3%)
         """
@@ -247,15 +247,17 @@ class LOBEnv(gym.Env):
         # Latency tracking
         self._last_latency_ns = 0       # Last sampled latency
         self._latency_samples = []      # History of latencies
-        
-        # Action space:
-        # 0 = Hold
-        # 1-5 = Limit Buy at best bid - (0,1,2,3,4) ticks
-        # 6-10 = Limit Sell at best ask + (0,1,2,3,4) ticks  
-        # 11 = Market Buy
-        # 12 = Market Sell
-        # 13 = Cancel all agent orders
-        self.action_space = spaces.Discrete(14)
+
+        # Action space (EXECUTION-SIDE AGNOSTIC):
+        # The agent executes on ONE side (self.execution_side), so actions are relative to that side
+        # 0 = Hold (do nothing)
+        # 1-5 = Limit order at best price - (0,1,2,3,4) ticks (passive, join/improve queue)
+        # 6 = Market order (aggressive, immediate execution)
+        # 7 = Cancel all active orders
+        #
+        # For SELL execution: action 1 = limit at best ask, action 2 = best ask + 1, etc.
+        # For BUY execution: action 1 = limit at best bid, action 2 = best bid - 1, etc.
+        self.action_space = spaces.Discrete(8)
         
         # Observation space: [bid_prices, bid_qtys, ask_prices, ask_qtys, position, cash, time, active_orders, progress, time_remaining]
         # Normalized to reasonable ranges
@@ -467,51 +469,56 @@ class LOBEnv(gym.Env):
         return obs, step_reward, terminated, truncated, info
     
     def _execute_action(self, action: int):
-        """Execute the given action."""
+        """
+        Execute the given action (EXECUTION-SIDE AGNOSTIC).
+
+        Actions are relative to the execution side (self.execution_side):
+        - For SELL: actions place sell orders
+        - For BUY: actions place buy orders
+
+        This simplifies the action space from 14 to 8, removing redundant actions.
+        """
         if action == 0:
             # Hold - do nothing
             return
 
-        book_state = self._orderbook.GetOrderInfos()
-        bids = book_state.GetBids()
-        asks = book_state.GetAsks()
-
-        current_time = self._exchange.GetCurrentTime()
-
-        # Calculate adaptive order size based on remaining quantity
+        # Check if we have quantity left to execute
         remaining_qty = self._total_qty - self._executed_qty
         if remaining_qty <= 0:
             return  # Nothing left to execute
 
-        # Order size: 10% of remaining, min 1, max 20% of target
+        # Calculate adaptive order size
         order_qty = max(1, min(
             int(remaining_qty * 0.10),  # 10% of remaining
             int(self._total_qty * 0.20)  # Cap at 20% of target
         ))
 
-        if action <= 5:  # Limit Buy (1-5)
-            if not bids:
-                return  # No bids to reference
-            best_bid = bids[0].price
-            offset = action - 1
-            price = best_bid - offset
-            self._place_limit_order(ob.Side.BUY, price, order_qty, current_time)
+        current_time = self._exchange.GetCurrentTime()
+        book_state = self._orderbook.GetOrderInfos()
+        bids = book_state.GetBids()
+        asks = book_state.GetAsks()
 
-        elif action <= 10:  # Limit Sell (6-10)
-            if not asks:
-                return  # No asks to reference
-            best_ask = asks[0].price
-            offset = action - 6
-            price = best_ask + offset
-            self._place_limit_order(ob.Side.SELL, price, order_qty, current_time)
+        if action <= 5:  # Limit order (passive)
+            offset = action - 1  # 0 to 4 ticks
 
-        elif action == 11:  # Market Buy
-            self._place_market_order(ob.Side.BUY, order_qty, current_time)
+            if self.execution_side == ob.Side.SELL:
+                # Selling: place limit sell at or above best ask
+                if not asks:
+                    return  # No asks to reference
+                price = asks[0].price + offset  # At ask (0) or higher (1-4)
+                self._place_limit_order(ob.Side.SELL, price, order_qty, current_time)
 
-        elif action == 12:  # Market Sell
-            self._place_market_order(ob.Side.SELL, order_qty, current_time)
+            else:  # BUY
+                # Buying: place limit buy at or below best bid
+                if not bids:
+                    return  # No bids to reference
+                price = bids[0].price - offset  # At bid (0) or lower (1-4)
+                self._place_limit_order(ob.Side.BUY, price, order_qty, current_time)
 
-        elif action == 13:  # Cancel all agent orders
+        elif action == 6:  # Market order (aggressive)
+            self._place_market_order(self.execution_side, order_qty, current_time)
+
+        elif action == 7:  # Cancel all active orders
             self._cancel_all_orders()
     
     def _place_limit_order(self, side: ob.Side, price: int, qty: int, timestamp: int):
@@ -752,7 +759,7 @@ class LOBEnv(gym.Env):
             # Update tracking
             self._executed_qty += qty
             self._execution_cost += price * qty
-            
+
             # Compute step reward (normalized implementation shortfall)
             if self._arrival_price > 0:
                 if self.execution_side == ob.Side.SELL:
@@ -761,57 +768,43 @@ class LOBEnv(gym.Env):
                 else:
                     # For buys: lower price = better = positive reward
                     slippage = (price - self._arrival_price) / self._arrival_price
-                
+
                 # Negative slippage is good (we beat arrival price)
                 step_reward -= slippage * qty
-        
+
+            # EXECUTION BONUS: Reward for making progress
+            # This encourages the agent to actually trade, not just hold
+            # Bonus is proportional to the fraction executed
+            execution_progress = qty / self._total_qty
+            execution_bonus = 0.1 * execution_progress  # Positive reward for executing
+            step_reward += execution_bonus
+
         self._exchange.ClearAgentFills()
         return step_reward
     
     def _compute_inventory_penalty(self) -> float:
         """
-        Compute running penalty for holding inventory using Almgren-Chriss style.
-        
-        This encourages the agent to actively trade rather than holding.
-        Uses Almgren-Chriss quadratic penalty: λ * σ² * q²
-        """
-        return self._compute_inventory_penalty_ac_style()
-    
-    def _compute_inventory_penalty_ac_style(self) -> float:
-        """
-        Almgren-Chriss style running penalty.
-        
-        Cost = λ * σ² * q² where q = remaining inventory
-        
-        This penalizes variance risk from holding inventory.
+        Compute running penalty for holding inventory.
+
+        SIMPLIFIED: Linear penalty that scales with inventory_penalty_coef.
+        This is much simpler and more predictable than the Almgren-Chriss style.
+
+        Returns:
+            Negative reward (penalty) for remaining unexecuted quantity
         """
         remaining = self._total_qty - self._executed_qty
         if remaining <= 0:
             return 0.0
-        
-        # Risk aversion parameter (matches A-C baseline)
-        lambda_risk = 1e-6  # Same as A-C default
-        
-        # Estimate price variance (could use actual data)
-        # For now, use a proxy based on spread
-        book_state = self._orderbook.GetOrderInfos()
-        bids = book_state.GetBids()
-        asks = book_state.GetAsks()
-        
-        if bids and asks:
-            spread = asks[0].price - bids[0].price
-            sigma_sq = (spread / 2) ** 2  # Rough variance proxy
-        else:
-            sigma_sq = 1.0  # Fallback
-        
-        # Quadratic inventory penalty
-        penalty = -lambda_risk * sigma_sq * (remaining ** 2)
-        
-        # Scale to reasonable range (the raw value may be tiny or huge)
-        penalty = penalty / (self._total_qty ** 2)  # Normalize by target
-        
-        # Apply coefficient scaling
-        return penalty * self.inventory_penalty_coef * 100  # Scale factor (tune this)
+
+        # Simple linear penalty: penalize remaining fraction
+        # Higher inventory_penalty_coef = stronger urgency to trade
+        fraction_remaining = remaining / self._total_qty
+
+        # Penalty scales linearly with remaining inventory
+        # With default coef=1.0, penalty is -0.1 per step when 100% remaining
+        penalty = -0.1 * fraction_remaining * self.inventory_penalty_coef
+
+        return penalty
     
     def _compute_terminal_penalty(self) -> float:
         """
