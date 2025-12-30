@@ -11,14 +11,19 @@ Based on best practices from rl-exec.pdf:
 Recent Updates:
 - Updated environment parameters (5s warmup, inventory_penalty_coef=1.0)
 - Fixed VecNormalize usage (set_venv method)
+- CRITICAL FIX: Added timestamp_unit_ns=1000 to all baselines (was causing 0 fills)
 - Added baseline synchronization (start_time_ns parameter)
 - Added comprehensive error handling (data exhaustion, step errors, baseline failures)
 - Added max_steps safety limit to prevent infinite loops
+- Conservative data duration estimate (1 hour default, configurable via --data-duration)
+- Conservative start time selection (first 20% of data to avoid running out)
 - Graceful degradation: baselines can fail independently without breaking evaluation
 
 Usage:
-    python src/py/evaluate.py --model models/best/best_model \
+    python src/py/evaluate.py \
+        --model models/best/best_model \
         --test-data data/test/*.csv \
+        --data-duration 2.0 \
         --output results/eval_results.json
 """
 
@@ -198,6 +203,7 @@ def run_twap_baseline(
     horizon_ns: int,
     target_qty: int,
     num_slices: int = 60,
+    timestamp_unit_ns: int = 1000,
 ) -> float:
     """Run TWAP baseline on exact same window."""
     executor = TWAPExecutor(
@@ -206,6 +212,7 @@ def run_twap_baseline(
         total_time_ns=horizon_ns,
         num_slices=num_slices,
         agent_latency_ns=10_000_000,  # 10ms institutional
+        timestamp_unit_ns=timestamp_unit_ns,  # CRITICAL: Must match RL env
     )
 
     # CRITICAL: Reset to same start time as RL agent
@@ -219,6 +226,7 @@ def run_vwap_baseline(
     horizon_ns: int,
     target_qty: int,
     num_slices: int = 60,
+    timestamp_unit_ns: int = 1000,
 ) -> float:
     """Run VWAP baseline on exact same window."""
     from src.py.baselines import VWAPExecutor
@@ -229,6 +237,7 @@ def run_vwap_baseline(
         total_time_ns=horizon_ns,
         num_slices=num_slices,
         agent_latency_ns=10_000_000,  # 10ms institutional
+        timestamp_unit_ns=timestamp_unit_ns,  # CRITICAL: Must match RL env
         verbose=False,
     )
 
@@ -244,6 +253,7 @@ def run_pov_baseline(
     target_qty: int,
     participation_rate: float = 0.1,
     num_slices: int = 60,
+    timestamp_unit_ns: int = 1000,
 ) -> float:
     """Run POV baseline on exact same window."""
     from src.py.baselines import POVExecutor
@@ -255,6 +265,7 @@ def run_pov_baseline(
         num_slices=num_slices,
         participation_rate=participation_rate,
         agent_latency_ns=10_000_000,  # 10ms institutional
+        timestamp_unit_ns=timestamp_unit_ns,  # CRITICAL: Must match RL env
         verbose=False,
     )
 
@@ -269,6 +280,7 @@ def run_ac_baseline(
     horizon_ns: int,
     target_qty: int,
     risk_aversion: float = 1e-6,
+    timestamp_unit_ns: int = 1000,
 ) -> float:
     """Run Almgren-Chriss baseline on exact same window."""
     executor = AlmgrenChrissExecutor(
@@ -277,6 +289,7 @@ def run_ac_baseline(
         total_time_ns=horizon_ns,
         risk_aversion=risk_aversion,
         agent_latency_ns=10_000_000,  # 10ms institutional
+        timestamp_unit_ns=timestamp_unit_ns,  # CRITICAL: Must match RL env
         verbose=False,
     )
 
@@ -421,6 +434,7 @@ def evaluate_agent(
     execution_side: str = "SELL",
     output_dir: str = "results",
     seed: int = 42,
+    data_duration_hours: float = 1.0,  # Expected data duration in hours
 ) -> Tuple[Dict, Dict]:
     """
     Proper per-day evaluation protocol from rl-exec.pdf:
@@ -489,8 +503,10 @@ def evaluate_agent(
         # Get data bounds (estimate from file)
         # For now, we'll use a fixed warmup and estimate total duration
         warmup_ns = 5_000_000_000  # 5s (updated from 60s to match environment)
-        # Estimate: assume 24 hours of data
-        total_duration_ns = 24 * 3600 * 1_000_000_000
+        # Use user-specified data duration (default: 1 hour)
+        # This prevents trying to start episodes beyond the available data
+        # TODO: Parse file to determine actual data range
+        total_duration_ns = int(data_duration_hours * 3600 * 1_000_000_000)
         
         # For each horizon
         for horizon_s, horizon_ns in zip(horizons, horizons_ns):
@@ -512,12 +528,22 @@ def evaluate_agent(
                 random.seed(run_seed)
                 np.random.seed(run_seed)
                 
-                # Randomize start time within the day
-                max_start = total_duration_ns - horizon_ns - warmup_ns
-                start_offset_ns = random.randint(
-                    int(warmup_ns),
-                    int(max_start) if max_start > warmup_ns else int(warmup_ns)
-                )
+                # Randomize start time within available data
+                # CRITICAL: Leave buffer at end to ensure we have enough data for full horizon
+                buffer_ns = 60_000_000_000  # 60s buffer at end
+                max_start = total_duration_ns - horizon_ns - warmup_ns - buffer_ns
+
+                # If not enough data for random starts, just use warmup time
+                if max_start <= warmup_ns:
+                    start_offset_ns = int(warmup_ns)
+                else:
+                    # Conservative: Use first 20% of available range for random starts
+                    # This reduces risk of hitting end of data
+                    safe_range = min(max_start - warmup_ns, total_duration_ns * 0.2)
+                    start_offset_ns = random.randint(
+                        int(warmup_ns),
+                        int(warmup_ns + safe_range)
+                    )
                 
                 print(f"    Run {run_idx+1}/{num_runs_per_day} (start: {start_offset_ns/1e9:.1f}s, seed: {run_seed})", end=" ... ")
                 
@@ -535,9 +561,11 @@ def evaluate_agent(
 
                     # Run baselines on EXACT SAME window (same seed ensures identical conditions)
                     # Wrap each baseline in try-except to prevent one failure from breaking all
+                    # CRITICAL: Pass timestamp_unit_ns=1000 (Tardis microseconds) to match RL env
                     try:
                         twap_slippage = run_twap_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            timestamp_unit_ns=1000
                         )
                         daily_twap_results.append(twap_slippage)
                     except Exception as e:
@@ -546,7 +574,8 @@ def evaluate_agent(
 
                     try:
                         vwap_slippage = run_vwap_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            timestamp_unit_ns=1000
                         )
                         daily_vwap_results.append(vwap_slippage)
                     except Exception as e:
@@ -556,7 +585,8 @@ def evaluate_agent(
                     try:
                         pov_slippage = run_pov_baseline(
                             test_day, start_offset_ns, horizon_ns, target_qty,
-                            participation_rate=0.1
+                            participation_rate=0.1,
+                            timestamp_unit_ns=1000
                         )
                         daily_pov_results.append(pov_slippage)
                     except Exception as e:
@@ -566,7 +596,8 @@ def evaluate_agent(
                     try:
                         ac_slippage = run_ac_baseline(
                             test_day, start_offset_ns, horizon_ns, target_qty,
-                            risk_aversion=1e-6  # Default
+                            risk_aversion=1e-6,  # Default
+                            timestamp_unit_ns=1000
                         )
                         daily_ac_results.append(ac_slippage)
                     except Exception as e:
@@ -576,7 +607,8 @@ def evaluate_agent(
                     try:
                         ac_low_risk_slippage = run_ac_baseline(
                             test_day, start_offset_ns, horizon_ns, target_qty,
-                            risk_aversion=1e-7  # Low risk aversion
+                            risk_aversion=1e-7,  # Low risk aversion
+                            timestamp_unit_ns=1000
                         )
                         daily_ac_low_risk_results.append(ac_low_risk_slippage)
                     except Exception as e:
@@ -586,7 +618,8 @@ def evaluate_agent(
                     try:
                         ac_high_risk_slippage = run_ac_baseline(
                             test_day, start_offset_ns, horizon_ns, target_qty,
-                            risk_aversion=1e-5  # High risk aversion
+                            risk_aversion=1e-5,  # High risk aversion
+                            timestamp_unit_ns=1000
                         )
                         daily_ac_high_risk_results.append(ac_high_risk_slippage)
                     except Exception as e:
@@ -742,9 +775,12 @@ def main():
                         help="Execution side (default: SELL)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
-    
+    parser.add_argument("--data-duration", type=float, default=1.0,
+                        help="Expected data duration in hours (default: 1.0). "
+                             "Increase if your data files contain more hours of data.")
+
     args = parser.parse_args()
-    
+
     evaluate_agent(
         agent_path=args.model,
         test_data_paths=args.test_data,
@@ -755,6 +791,7 @@ def main():
         execution_side=args.side,
         output_dir=args.output_dir,
         seed=args.seed,
+        data_duration_hours=args.data_duration,
     )
 
 
