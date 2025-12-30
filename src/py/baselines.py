@@ -126,20 +126,37 @@ class BaselineExecutor:
         self.fills: List[Dict] = []
         self.trajectory: List[Dict] = []
         
-    def reset(self):
-        """Initialize fresh orderbook and exchange."""
+    def reset(self, start_time_ns: Optional[int] = None):
+        """
+        Initialize fresh orderbook and exchange.
+
+        Args:
+            start_time_ns: Optional timestamp to start execution at (for fair comparison with RL).
+                          If None, starts after warmup from beginning of file.
+                          If specified, advances to this timestamp before execution starts.
+        """
         self.orderbook = ob.Orderbook()
         self.exchange = ob.ExchangeSimulator(self.orderbook)
         self.loader = ob.DataLoader(self.data_path, self.timestamp_unit_ns)
-        
+
         # Warmup: build initial book
         if self.loader.HasMoreData():
             first_ts = self.loader.PeekNextTimestampNs()
-            target = first_ts + self.warmup_duration_ns
+
+            if start_time_ns is not None:
+                # CRITICAL: Advance to same start time as RL agent for fair comparison
+                # This ensures baselines see the same market conditions as RL
+                target = start_time_ns
+                if self.verbose:
+                    print(f"Advancing to RL start time: {start_time_ns / 1e9:.1f}s from file start")
+            else:
+                # Default: warmup from beginning
+                target = first_ts + self.warmup_duration_ns
+
             events = self.loader.PumpToExchange(self.exchange, target)
             if self.verbose:
                 print(f"Warmup: Pumped {events} events, book size: {self.orderbook.Size()}")
-        
+
         # Reset tracking
         self.order_id_counter = 1_000_000
         self.qty_remaining = self.total_qty
@@ -351,17 +368,25 @@ class BaselineExecutor:
         # Terminal price
         result.terminal_price = self.get_mid_price()
         
-        # Implementation shortfall
+        # Implementation shortfall (signed: positive = bad, negative = good)
         if self.side == ob.Side.BUY:
             # For buys: IS = (execution_price - arrival_price) * qty
+            # Positive = paid more than arrival (bad), Negative = paid less (good)
             result.implementation_shortfall = (result.vwap - arrival_price) * total_qty
         else:
             # For sells: IS = (arrival_price - execution_price) * qty
+            # Positive = sold for less than arrival (bad), Negative = sold for more (good)
             result.implementation_shortfall = (arrival_price - result.vwap) * total_qty
-        
-        # Slippage in basis points
+
+        # Slippage in basis points (SIGNED for proper comparison)
+        # Positive = worse than arrival, Negative = better than arrival
         if arrival_price > 0:
-            result.slippage_bps = abs(result.vwap - arrival_price) / arrival_price * 10000
+            if self.side == ob.Side.BUY:
+                # For buys: positive slippage = paid more (bad)
+                result.slippage_bps = (result.vwap - arrival_price) / arrival_price * 10000
+            else:
+                # For sells: positive slippage = sold for less (bad)
+                result.slippage_bps = (arrival_price - result.vwap) / arrival_price * 10000
         
         result.fills = self.fills
         result.trajectory = self.trajectory
@@ -407,9 +432,14 @@ class TWAPExecutor(BaselineExecutor):
         self.slice_qty = total_qty // num_slices
         self.slice_interval_ns = total_time_ns // num_slices
         
-    def execute(self) -> ExecutionResult:
-        """Execute TWAP strategy."""
-        self.reset()
+    def execute(self, start_time_ns: Optional[int] = None) -> ExecutionResult:
+        """
+        Execute TWAP strategy.
+
+        Args:
+            start_time_ns: Optional timestamp to start execution at (for fair comparison with RL).
+        """
+        self.reset(start_time_ns)
         
         if self.verbose:
             print(f"\n{'='*60}")
@@ -463,16 +493,21 @@ class TWAPExecutor(BaselineExecutor):
 class VWAPExecutor(BaselineExecutor):
     """
     Volume-Weighted Average Price (VWAP) Strategy.
-    
+
     Industry standard benchmark. Executes proportionally to market volume.
     The goal is to match the market's VWAP over the execution period.
-    
+
     Implementation:
-    - Divide execution into time slices
-    - In each slice, execute proportionally to market volume in that slice
+    - Pre-scan data to measure market volume in each time slice
+    - Execute proportionally to observed volume distribution
     - Uses market orders to match market VWAP
+
+    Algorithm:
+    1. Divide execution window into N time slices
+    2. Measure market volume V_i in each slice i
+    3. Execute quantity: Q_i = Q_total * (V_i / V_total)
     """
-    
+
     def __init__(
         self,
         data_path: str,
@@ -484,56 +519,134 @@ class VWAPExecutor(BaselineExecutor):
         super().__init__(data_path, total_qty, total_time_ns, **kwargs)
         self.num_slices = num_slices
         self.slice_interval_ns = total_time_ns // num_slices
-        
-    def execute(self) -> ExecutionResult:
-        """Execute VWAP strategy."""
-        self.reset()
-        
+
+    def _scan_volume_profile(self, start_time_ns: Optional[int] = None) -> List[int]:
+        """
+        Pre-scan the data to measure market volume in each time slice.
+
+        Returns:
+            List of volume counts per slice (events as proxy for volume)
+        """
+        # Create temporary loader to scan volume
+        temp_loader = ob.DataLoader(self.data_path, self.timestamp_unit_ns)
+
+        # Advance to start time
+        if temp_loader.HasMoreData():
+            first_ts = temp_loader.PeekNextTimestampNs()
+            if start_time_ns is not None:
+                target = start_time_ns
+            else:
+                target = first_ts + self.warmup_duration_ns
+
+            # Create temporary exchange for scanning
+            temp_orderbook = ob.Orderbook()
+            temp_exchange = ob.ExchangeSimulator(temp_orderbook)
+            temp_loader.PumpToExchange(temp_exchange, target)
+
+        # Initialize volume counters
+        slice_volumes = [0] * self.num_slices
+        execution_start = temp_exchange.GetCurrentTime() if hasattr(temp_exchange, 'GetCurrentTime') else 0
+
+        # Scan through execution window
+        for i in range(self.num_slices):
+            slice_start = execution_start + i * self.slice_interval_ns
+            slice_end = slice_start + self.slice_interval_ns
+
+            # Count events (trades) in this slice as proxy for volume
+            events_in_slice = 0
+
+            while temp_loader.HasMoreData():
+                next_ts = temp_loader.PeekNextTimestampNs()
+
+                if next_ts >= slice_end:
+                    break  # Move to next slice
+
+                # Pump one event
+                temp_loader.PumpToExchange(temp_exchange, next_ts + 1)
+                events_in_slice += 1
+
+            slice_volumes[i] = events_in_slice
+
+        return slice_volumes
+
+    def execute(self, start_time_ns: Optional[int] = None) -> ExecutionResult:
+        """
+        Execute TRUE VWAP strategy (volume-weighted).
+
+        Args:
+            start_time_ns: Optional timestamp to start execution at (for fair comparison with RL).
+        """
         if self.verbose:
             print(f"\n{'='*60}")
-            print("VWAP EXECUTION")
+            print("VWAP EXECUTION (TRUE VOLUME-WEIGHTED)")
             print(f"{'='*60}")
             print(f"Total Qty: {self.total_qty}")
             print(f"Num Slices: {self.num_slices}")
             print(f"Interval: {self.slice_interval_ns / 1e9:.1f}s")
             print()
-        
+            print("Pre-scanning market volume...")
+
+        # STEP 1: Pre-scan to get volume distribution
+        slice_volumes = self._scan_volume_profile(start_time_ns)
+        total_volume = sum(slice_volumes)
+
+        if total_volume == 0:
+            # Fallback to uniform if no volume data
+            if self.verbose:
+                print("WARNING: No volume data found, falling back to uniform TWAP")
+            slice_volumes = [1] * self.num_slices
+            total_volume = self.num_slices
+
+        # Calculate target quantities per slice (proportional to volume)
+        slice_quantities = []
+        remaining_qty = self.total_qty
+
+        for i in range(self.num_slices):
+            if total_volume > 0:
+                # Proportional to volume
+                volume_fraction = slice_volumes[i] / total_volume
+                target_qty = int(self.total_qty * volume_fraction)
+            else:
+                target_qty = 0
+
+            # Ensure we don't exceed remaining
+            target_qty = min(target_qty, remaining_qty)
+            slice_quantities.append(target_qty)
+            remaining_qty -= target_qty
+
+        # Add any remainder to the slice with highest volume
+        if remaining_qty > 0 and slice_volumes:
+            max_volume_idx = slice_volumes.index(max(slice_volumes))
+            slice_quantities[max_volume_idx] += remaining_qty
+
+        if self.verbose:
+            print(f"Volume profile scanned: total={total_volume} events")
+            print(f"Slice allocations: {slice_quantities[:10]}..." if len(slice_quantities) > 10 else f"Slice allocations: {slice_quantities}")
+            print()
+
+        # STEP 2: Execute with actual volume-weighted distribution
+        self.reset(start_time_ns)
         arrival_price = self.get_mid_price()
 
-        # VWAP strategy: Execute proportionally to market volume
-        # Simplified: Use uniform distribution (time-weighted) as baseline
-        # In production, this would track actual market volume and execute proportionally
-        # For now, we use uniform time slices (similar to TWAP but conceptually VWAP)
-        # This is a reasonable baseline approximation
-        base_slice_qty = self.total_qty // self.num_slices
-        
         for i in range(self.num_slices):
-            # Calculate target quantity for this slice
-            # In a real VWAP, this would be proportional to market volume in the slice
-            # For baseline, we use uniform distribution (time-weighted VWAP)
-            target_slice_qty = base_slice_qty
-            # Add remainder to last slice
-            if i == self.num_slices - 1:
-                target_slice_qty += self.total_qty % self.num_slices
-            
-            # Ensure we don't exceed remaining quantity
-            slice_qty = min(target_slice_qty, self.qty_remaining)
-            
             # Record trajectory
-            self.record_trajectory(self.qty_remaining - slice_qty, self.qty_remaining)
-            
-            # Execute slice
+            target_remaining = sum(slice_quantities[i+1:])
+            self.record_trajectory(target_remaining, self.qty_remaining)
+
+            # Execute slice (quantity determined by volume)
+            slice_qty = min(slice_quantities[i], self.qty_remaining)
             if slice_qty > 0:
                 self.place_market_order(slice_qty)
-                
+
                 if self.verbose and (i + 1) % 10 == 0:
                     print(f"Slice {i+1}/{self.num_slices}: "
+                          f"Volume={slice_volumes[i]}, "
                           f"Executed {slice_qty}, Remaining: {self.qty_remaining}, "
                           f"Mid: {self.get_mid_price():.2f}")
-            
+
             # Advance time to next slice
             self.step(self.slice_interval_ns)
-            
+
             # Check if we're done or out of data
             if self.qty_remaining <= 0:
                 break
@@ -541,7 +654,7 @@ class VWAPExecutor(BaselineExecutor):
                 if self.verbose:
                     print("Out of market data!")
                 break
-        
+
         # Calculate final metrics
         result = self.calculate_metrics(arrival_price)
         result.strategy = "VWAP"
@@ -579,9 +692,14 @@ class POVExecutor(BaselineExecutor):
         self.slice_interval_ns = total_time_ns // num_slices
         self.participation_rate = participation_rate  # e.g., 0.1 = 10% of market volume
         
-    def execute(self) -> ExecutionResult:
-        """Execute POV strategy."""
-        self.reset()
+    def execute(self, start_time_ns: Optional[int] = None) -> ExecutionResult:
+        """
+        Execute POV strategy.
+
+        Args:
+            start_time_ns: Optional timestamp to start execution at (for fair comparison with RL).
+        """
+        self.reset(start_time_ns)
         
         if self.verbose:
             print(f"\n{'='*60}")
@@ -734,9 +852,14 @@ class AlmgrenChrissExecutor(BaselineExecutor):
         
         return X * np.sinh(kappa * remaining_time) / np.sinh(kappa * T)
     
-    def execute(self) -> ExecutionResult:
-        """Execute Almgren-Chriss strategy."""
-        self.reset()
+    def execute(self, start_time_ns: Optional[int] = None) -> ExecutionResult:
+        """
+        Execute Almgren-Chriss strategy.
+
+        Args:
+            start_time_ns: Optional timestamp to start execution at (for fair comparison with RL).
+        """
+        self.reset(start_time_ns)
         
         # Use same number of steps as TWAP slices for fair comparison
         # This ensures both strategies execute over the same time horizon

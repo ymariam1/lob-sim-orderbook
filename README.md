@@ -59,12 +59,49 @@ Key arguments:
 - `--train-data`: Directory containing training CSV files
 - `--test-data`: Directory containing test CSV files (separate from training)
 - `--timesteps`: Total training timesteps (default: 100k)
+- `--model-size`: Model size preset - `small`, `base`, `large`, or `xlarge` (default: base)
+  - `small`: [64, 64] - Fast training, lower capacity
+  - `base`: [128, 128] - Balanced (default)
+  - `large`: [256, 256] - Higher capacity, slower training
+  - `xlarge`: [512, 512] - Maximum capacity, slowest training
 - `--agent-type`: Latency profile - `hft`, `institutional`, or `retail` (default: institutional)
-- `--target-qty`: Target quantity per episode (default: 100)
+- `--target-qty`: Target quantity per episode (default: calculated from volume)
 - `--lr`: Learning rate (default: 3e-4)
-- `--net-arch`: Network architecture (default: 64 64)
+- `--net-arch`: Custom network architecture (overrides `--model-size`)
 
-### 3. Evaluate the Model
+### 3. Train with Different Model Sizes
+
+```bash
+# Small model (fast, lower capacity)
+python src/py/train_rl.py \
+  --train-data data/train \
+  --test-data data/test \
+  --model-size small \
+  --timesteps 100000
+
+# Base model (balanced - default)
+python src/py/train_rl.py \
+  --train-data data/train \
+  --test-data data/test \
+  --model-size base \
+  --timesteps 100000
+
+# Large model (higher capacity)
+python src/py/train_rl.py \
+  --train-data data/train \
+  --test-data data/test \
+  --model-size large \
+  --timesteps 200000
+
+# XLarge model (maximum capacity)
+python src/py/train_rl.py \
+  --train-data data/train \
+  --test-data data/test \
+  --model-size xlarge \
+  --timesteps 500000
+```
+
+### 4. Evaluate the Model
 
 ```bash
 python src/py/train_rl.py \
@@ -75,6 +112,29 @@ python src/py/train_rl.py \
 ```
 
 This runs the trained model on test data and compares against VWAP/POV baselines.
+
+### 5. Multi-Seed Training (for academic rigor)
+
+For statistically valid results, train multiple models with different seeds:
+
+```bash
+python train_multi_seed.py \
+  --train-data data/train \
+  --test-data data/test \
+  --n-seeds 5 \
+  --timesteps 100000 \
+  --model-size base
+```
+
+This trains 5 independent models, enabling proper statistical testing with mean ± std.
+
+### Model Checkpointing
+
+To save disk space, only the **best model** (based on evaluation performance) is saved during training:
+- **Best model**: `models/best/best_model.zip` - Use this for evaluation
+- **Latest model**: `models/ppo_lob_latest.zip` - For resuming interrupted training
+
+Intermediate checkpoints are NOT saved. If you need more frequent checkpoints, modify the `EvalCallback` frequency in `train_rl.py`.
 
 ## Project Structure
 
@@ -91,7 +151,7 @@ lob-sim-orderbook/
 │   └── py/                       # Python Layer
 │       ├── train_rl.py           # PPO training script with proper train/test split
 │       ├── gym.py                # Gymnasium RL environment (Implementation Shortfall reward)
-│       ├── baselines.py          # VWAP, POV, and Almgren-Chriss baselines
+│       ├── baselines.py          # VWAP (true volume-weighted), POV, TWAP, and Almgren-Chriss baselines
 │       └── latency.py            # Stochastic latency simulation
 │
 ├── data/
