@@ -8,9 +8,17 @@ Based on best practices from rl-exec.pdf:
 - Statistical testing (Wilcoxon, bootstrap CIs)
 - Effect sizes and win rates
 
+Recent Updates:
+- Updated environment parameters (5s warmup, inventory_penalty_coef=1.0)
+- Fixed VecNormalize usage (set_venv method)
+- Added baseline synchronization (start_time_ns parameter)
+- Added comprehensive error handling (data exhaustion, step errors, baseline failures)
+- Added max_steps safety limit to prevent infinite loops
+- Graceful degradation: baselines can fail independently without breaking evaluation
+
 Usage:
-    python src/py/evaluate.py --model models/ppo_lob_latest \
-        --test-data data/csv/blockchain_l3_2023-06-01.csv \
+    python src/py/evaluate.py --model models/best/best_model \
+        --test-data data/test/*.csv \
         --output results/eval_results.json
 """
 
@@ -62,97 +70,126 @@ def run_rl_episode(
 ) -> Tuple[float, float, Dict]:
     """
     Run a single RL episode with fixed start time and horizon.
-    
+
     Returns:
         (slippage_bps, completion_rate, episode_info)
     """
-    # Create environment
+    # Create environment with UPDATED parameters
     env = LOBEnv(
         data_path=data_path,
         agent_type=agent_type,
-        timestamp_unit_ns=1000,
+        timestamp_unit_ns=1000,  # Tardis microseconds
         target_qty=target_qty,
         execution_side=execution_side,
-        warmup_duration_ns=60_000_000_000,  # 60s warmup
+        warmup_duration_ns=5_000_000_000,  # 5s warmup (updated from 60s)
         step_duration_ns=10_000_000,  # 10ms steps
+        inventory_penalty_coef=1.0,  # NEW DEFAULT (increased from 0.01)
     )
-    
-    # Wrap with VecNormalize if provided
+
+    # CRITICAL: VecNormalize must wrap the env BEFORE use
+    # Cannot use normalize_obs() - must wrap entire env
     if vec_normalize:
-        env = vec_normalize.normalize_obs(env)
-    
-    # Reset and advance to start time
-    obs, info = env.reset()
-    arrival_price = info["arrival_price"]
-    
-    # Advance to start time (if needed)
-    current_time = env._exchange.GetCurrentTime()
-    if current_time < start_time_ns:
-        advance_ns = start_time_ns - current_time
-        env._loader.PumpToExchange(env._exchange, advance_ns)
-    
-    # Run episode
+        # Update the env in vec_normalize wrapper
+        vec_normalize.set_venv(DummyVecEnv([lambda: env]))
+        vec_normalize.training = False
+        vec_normalize.norm_reward = False
+
+    # Reset with start_time_ns parameter
+    obs, info = env.reset(options={"start_time_ns": start_time_ns})
+    arrival_price = info.get("arrival_price", 0.0)
+
+    # Run episode with try-finally to ensure cleanup
     total_reward = 0
     actions = []
     fills = []
     prices = []
     inventory = []
-    
-    episode_start_time = env._exchange.GetCurrentTime()
-    target_end_time = episode_start_time + horizon_ns
-    
-    while env._exchange.GetCurrentTime() < target_end_time:
-        # Get action from agent
-        action, _ = agent.predict(obs, deterministic=True)
-        actions.append(action)
-        
-        # Step
-        obs, reward, term, trunc, info = env.step(action)
-        total_reward += reward
-        
-        # Track state
-        prices.append(info["mid_price"])
-        inventory.append(info["executed_qty"])
-        
-        # Track fills
-        if "vwap" in info:
-            fills.append({
-                "price": info["vwap"],
-                "qty": info["executed_qty"],
-                "time": env._exchange.GetCurrentTime(),
-            })
-        
-        if term or trunc:
-            break
-    
-    # Final metrics
-    final_info = env._get_info()
-    executed_qty = final_info["executed_qty"]
-    completion_rate = executed_qty / target_qty if target_qty > 0 else 0
-    
-    # Calculate slippage
-    if executed_qty > 0 and "vwap" in final_info:
-        vwap = final_info["vwap"]
-        slippage_bps = abs(vwap - arrival_price) / arrival_price * 10000
-    else:
-        slippage_bps = 1000.0  # Penalty for incomplete execution
-    
-    episode_info = {
-        "total_reward": total_reward,
-        "slippage_bps": slippage_bps,
-        "completion_rate": completion_rate,
-        "executed_qty": executed_qty,
-        "arrival_price": arrival_price,
-        "final_price": final_info.get("vwap", arrival_price),
-        "num_fills": len(fills),
-        "actions": actions,
-        "prices": prices,
-        "inventory": inventory,
-        "fills": fills,
-    }
-    
-    env.close()
-    return slippage_bps, completion_rate, episode_info
+
+    try:
+        episode_start_time = env._exchange.GetCurrentTime()
+        target_end_time = episode_start_time + horizon_ns
+
+        max_steps = 100000  # Safety limit to prevent infinite loops
+        step_count = 0
+
+        while env._exchange.GetCurrentTime() < target_end_time and step_count < max_steps:
+            try:
+                # Check if data loader has more data (prevents breaking on data exhaustion)
+                if hasattr(env, '_loader') and env._loader is not None:
+                    if not env._loader.HasMoreData():
+                        # Gracefully exit if we run out of data
+                        break
+
+                # Get action from agent
+                action, _ = agent.predict(obs, deterministic=True)
+                actions.append(action)
+
+                # Step
+                obs, reward, term, trunc, info = env.step(action)
+                total_reward += reward
+                step_count += 1
+
+                # Track state
+                prices.append(info.get("mid_price", 0.0))
+                inventory.append(info.get("executed_qty", 0))
+
+                # Track fills
+                if "vwap" in info:
+                    fills.append({
+                        "price": info["vwap"],
+                        "qty": info["executed_qty"],
+                        "time": env._exchange.GetCurrentTime(),
+                    })
+
+                if term or trunc:
+                    break
+
+            except Exception as e:
+                # Gracefully handle errors during episode
+                print(f"\n    WARNING: Episode error at step {step_count}: {e}")
+                break
+
+        # Final metrics
+        try:
+            final_info = env._get_info()
+            executed_qty = final_info.get("executed_qty", 0)
+            completion_rate = executed_qty / target_qty if target_qty > 0 else 0
+
+            # Calculate slippage
+            if executed_qty > 0 and "vwap" in final_info:
+                vwap = final_info["vwap"]
+                if arrival_price > 0:
+                    slippage_bps = abs(vwap - arrival_price) / arrival_price * 10000
+                else:
+                    slippage_bps = 1000.0  # Penalty if no valid arrival price
+            else:
+                slippage_bps = 1000.0  # Penalty for incomplete execution
+        except Exception as e:
+            print(f"\n    WARNING: Error computing final metrics: {e}")
+            executed_qty = 0
+            completion_rate = 0.0
+            slippage_bps = 1000.0
+            final_info = {"executed_qty": 0}
+
+        episode_info = {
+            "total_reward": total_reward,
+            "slippage_bps": slippage_bps,
+            "completion_rate": completion_rate,
+            "executed_qty": executed_qty,
+            "arrival_price": arrival_price,
+            "final_price": final_info.get("vwap", arrival_price),
+            "num_fills": len(fills),
+            "actions": actions,
+            "prices": prices,
+            "inventory": inventory,
+            "fills": fills,
+        }
+
+        return slippage_bps, completion_rate, episode_info
+
+    finally:
+        # Always close environment, even if errors occur
+        env.close()
 
 
 def run_twap_baseline(
@@ -170,8 +207,9 @@ def run_twap_baseline(
         num_slices=num_slices,
         agent_latency_ns=10_000_000,  # 10ms institutional
     )
-    
-    result = executor.execute()
+
+    # CRITICAL: Reset to same start time as RL agent
+    result = executor.execute(start_time_ns=start_time_ns)
     return result.slippage_bps  # ExecutionResult is a dataclass, access attribute directly
 
 
@@ -184,7 +222,7 @@ def run_vwap_baseline(
 ) -> float:
     """Run VWAP baseline on exact same window."""
     from src.py.baselines import VWAPExecutor
-    
+
     executor = VWAPExecutor(
         data_path=data_path,
         total_qty=target_qty,
@@ -193,8 +231,9 @@ def run_vwap_baseline(
         agent_latency_ns=10_000_000,  # 10ms institutional
         verbose=False,
     )
-    
-    result = executor.execute()
+
+    # CRITICAL: Reset to same start time as RL agent
+    result = executor.execute(start_time_ns=start_time_ns)
     return result.slippage_bps
 
 
@@ -208,7 +247,7 @@ def run_pov_baseline(
 ) -> float:
     """Run POV baseline on exact same window."""
     from src.py.baselines import POVExecutor
-    
+
     executor = POVExecutor(
         data_path=data_path,
         total_qty=target_qty,
@@ -218,8 +257,9 @@ def run_pov_baseline(
         agent_latency_ns=10_000_000,  # 10ms institutional
         verbose=False,
     )
-    
-    result = executor.execute()
+
+    # CRITICAL: Reset to same start time as RL agent
+    result = executor.execute(start_time_ns=start_time_ns)
     return result.slippage_bps
 
 
@@ -239,8 +279,9 @@ def run_ac_baseline(
         agent_latency_ns=10_000_000,  # 10ms institutional
         verbose=False,
     )
-    
-    result = executor.execute()
+
+    # CRITICAL: Reset to same start time as RL agent
+    result = executor.execute(start_time_ns=start_time_ns)
     return result.slippage_bps  # ExecutionResult is a dataclass, access attribute directly
 
 
@@ -447,7 +488,7 @@ def evaluate_agent(
         
         # Get data bounds (estimate from file)
         # For now, we'll use a fixed warmup and estimate total duration
-        warmup_ns = 60_000_000_000  # 60s
+        warmup_ns = 5_000_000_000  # 5s (updated from 60s to match environment)
         # Estimate: assume 24 hours of data
         total_duration_ns = 24 * 3600 * 1_000_000_000
         
@@ -483,7 +524,7 @@ def evaluate_agent(
                 try:
                     # CRITICAL: Run RL agent and baselines on EXACT SAME window
                     # They must see identical market conditions for fair comparison
-                    
+
                     # Run RL agent
                     rl_slippage, rl_completion, rl_info = run_rl_episode(
                         agent, vec_normalize, test_day,
@@ -491,42 +532,67 @@ def evaluate_agent(
                         agent_type, execution_side
                     )
                     daily_rl_results.append(rl_slippage)
-                    
+
                     # Run baselines on EXACT SAME window (same seed ensures identical conditions)
-                    twap_slippage = run_twap_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty
-                    )
-                    daily_twap_results.append(twap_slippage)
-                    
-                    vwap_slippage = run_vwap_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty
-                    )
-                    daily_vwap_results.append(vwap_slippage)
-                    
-                    pov_slippage = run_pov_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty,
-                        participation_rate=0.1
-                    )
-                    daily_pov_results.append(pov_slippage)
-                    
-                    ac_slippage = run_ac_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty,
-                        risk_aversion=1e-6  # Default
-                    )
-                    daily_ac_results.append(ac_slippage)
-                    
-                    ac_low_risk_slippage = run_ac_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty,
-                        risk_aversion=1e-7  # Low risk aversion
-                    )
-                    daily_ac_low_risk_results.append(ac_low_risk_slippage)
-                    
-                    ac_high_risk_slippage = run_ac_baseline(
-                        test_day, start_offset_ns, horizon_ns, target_qty,
-                        risk_aversion=1e-5  # High risk aversion
-                    )
-                    daily_ac_high_risk_results.append(ac_high_risk_slippage)
-                    
+                    # Wrap each baseline in try-except to prevent one failure from breaking all
+                    try:
+                        twap_slippage = run_twap_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty
+                        )
+                        daily_twap_results.append(twap_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: TWAP baseline failed: {e}")
+                        twap_slippage = 1000.0
+
+                    try:
+                        vwap_slippage = run_vwap_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty
+                        )
+                        daily_vwap_results.append(vwap_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: VWAP baseline failed: {e}")
+                        vwap_slippage = 1000.0
+
+                    try:
+                        pov_slippage = run_pov_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            participation_rate=0.1
+                        )
+                        daily_pov_results.append(pov_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: POV baseline failed: {e}")
+                        pov_slippage = 1000.0
+
+                    try:
+                        ac_slippage = run_ac_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            risk_aversion=1e-6  # Default
+                        )
+                        daily_ac_results.append(ac_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: AC baseline failed: {e}")
+                        ac_slippage = 1000.0
+
+                    try:
+                        ac_low_risk_slippage = run_ac_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            risk_aversion=1e-7  # Low risk aversion
+                        )
+                        daily_ac_low_risk_results.append(ac_low_risk_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: AC (low risk) baseline failed: {e}")
+                        ac_low_risk_slippage = 1000.0
+
+                    try:
+                        ac_high_risk_slippage = run_ac_baseline(
+                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            risk_aversion=1e-5  # High risk aversion
+                        )
+                        daily_ac_high_risk_results.append(ac_high_risk_slippage)
+                    except Exception as e:
+                        print(f"\n    WARNING: AC (high risk) baseline failed: {e}")
+                        ac_high_risk_slippage = 1000.0
+
                     print(f"RL: {rl_slippage:.2f}bps, TWAP: {twap_slippage:.2f}bps, "
                           f"VWAP: {vwap_slippage:.2f}bps, POV: {pov_slippage:.2f}bps, "
                           f"AC: {ac_slippage:.2f}bps, AC(λ=1e-7): {ac_low_risk_slippage:.2f}bps, "
