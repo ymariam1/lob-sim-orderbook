@@ -11,11 +11,15 @@ Based on best practices from rl-exec.pdf:
 Recent Updates:
 - Updated environment parameters (5s warmup, inventory_penalty_coef=1.0)
 - Fixed VecNormalize usage (set_venv method)
-- CRITICAL FIX: Added timestamp_unit_ns=1000 to all baselines (was causing 0 fills)
+- CRITICAL FIX: Convert relative offsets to absolute timestamps (was causing 0 fills!)
+  * CSV files have absolute Unix epoch timestamps (e.g., 1738386000422432 microseconds)
+  * Environment expects absolute timestamps, not relative offsets
+  * Now reads first timestamp from CSV and adds relative offset to get absolute time
+- Added timestamp_unit_ns=1000 to all baselines (Tardis/Blockchain microseconds)
 - Added baseline synchronization (start_time_ns parameter)
 - Added comprehensive error handling (data exhaustion, step errors, baseline failures)
 - Added max_steps safety limit to prevent infinite loops
-- Conservative data duration estimate (1 hour default, configurable via --data-duration)
+- Conservative data duration estimate (--data-duration flag, default 1 hour)
 - Conservative start time selection (first 20% of data to avoid running out)
 - Graceful degradation: baselines can fail independently without breaking evaluation
 
@@ -499,13 +503,29 @@ def evaluate_agent(
     # For each test day
     for day_idx, test_day in enumerate(test_data_paths):
         print(f"\n[{day_idx+1}/{len(test_data_paths)}] Processing {test_day}")
-        
+
+        # CRITICAL: Read first timestamp from CSV to get file start time
+        # The timestamps in the file are absolute (Unix epoch microseconds)
+        # We need to convert relative offsets to absolute timestamps
+        import csv
+        try:
+            with open(test_day, 'r') as f:
+                reader = csv.reader(f)
+                next(reader)  # Skip header
+                first_row = next(reader)
+                file_start_timestamp_us = int(first_row[0])  # Microseconds
+                file_start_timestamp_ns = file_start_timestamp_us * 1000  # Convert to nanoseconds
+                print(f"  File starts at: {file_start_timestamp_us} us ({file_start_timestamp_ns / 1e9:.2f}s epoch time)")
+        except Exception as e:
+            print(f"  WARNING: Could not read first timestamp: {e}")
+            print(f"  Using default start time (this may cause issues)")
+            file_start_timestamp_ns = 0
+
         # Get data bounds (estimate from file)
         # For now, we'll use a fixed warmup and estimate total duration
         warmup_ns = 5_000_000_000  # 5s (updated from 60s to match environment)
         # Use user-specified data duration (default: 1 hour)
         # This prevents trying to start episodes beyond the available data
-        # TODO: Parse file to determine actual data range
         total_duration_ns = int(data_duration_hours * 3600 * 1_000_000_000)
         
         # For each horizon
@@ -533,19 +553,23 @@ def evaluate_agent(
                 buffer_ns = 60_000_000_000  # 60s buffer at end
                 max_start = total_duration_ns - horizon_ns - warmup_ns - buffer_ns
 
-                # If not enough data for random starts, just use warmup time
+                # Compute RELATIVE offset from file start
                 if max_start <= warmup_ns:
-                    start_offset_ns = int(warmup_ns)
+                    relative_offset_ns = int(warmup_ns)
                 else:
                     # Conservative: Use first 20% of available range for random starts
                     # This reduces risk of hitting end of data
                     safe_range = min(max_start - warmup_ns, total_duration_ns * 0.2)
-                    start_offset_ns = random.randint(
+                    relative_offset_ns = random.randint(
                         int(warmup_ns),
                         int(warmup_ns + safe_range)
                     )
-                
-                print(f"    Run {run_idx+1}/{num_runs_per_day} (start: {start_offset_ns/1e9:.1f}s, seed: {run_seed})", end=" ... ")
+
+                # CRITICAL: Convert relative offset to ABSOLUTE timestamp
+                # The RL environment and baselines expect absolute timestamps from the CSV
+                absolute_start_time_ns = file_start_timestamp_ns + relative_offset_ns
+
+                print(f"    Run {run_idx+1}/{num_runs_per_day} (offset: {relative_offset_ns/1e9:.1f}s, abs time: {absolute_start_time_ns/1e9:.2f}s, seed: {run_seed})", end=" ... ")
                 
                 try:
                     # CRITICAL: Run RL agent and baselines on EXACT SAME window
@@ -554,7 +578,7 @@ def evaluate_agent(
                     # Run RL agent
                     rl_slippage, rl_completion, rl_info = run_rl_episode(
                         agent, vec_normalize, test_day,
-                        start_offset_ns, horizon_ns, target_qty,
+                        absolute_start_time_ns, horizon_ns, target_qty,
                         agent_type, execution_side
                     )
                     daily_rl_results.append(rl_slippage)
@@ -564,7 +588,7 @@ def evaluate_agent(
                     # CRITICAL: Pass timestamp_unit_ns=1000 (Tardis microseconds) to match RL env
                     try:
                         twap_slippage = run_twap_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             timestamp_unit_ns=1000
                         )
                         daily_twap_results.append(twap_slippage)
@@ -574,7 +598,7 @@ def evaluate_agent(
 
                     try:
                         vwap_slippage = run_vwap_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             timestamp_unit_ns=1000
                         )
                         daily_vwap_results.append(vwap_slippage)
@@ -584,7 +608,7 @@ def evaluate_agent(
 
                     try:
                         pov_slippage = run_pov_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             participation_rate=0.1,
                             timestamp_unit_ns=1000
                         )
@@ -595,7 +619,7 @@ def evaluate_agent(
 
                     try:
                         ac_slippage = run_ac_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             risk_aversion=1e-6,  # Default
                             timestamp_unit_ns=1000
                         )
@@ -606,7 +630,7 @@ def evaluate_agent(
 
                     try:
                         ac_low_risk_slippage = run_ac_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             risk_aversion=1e-7,  # Low risk aversion
                             timestamp_unit_ns=1000
                         )
@@ -617,7 +641,7 @@ def evaluate_agent(
 
                     try:
                         ac_high_risk_slippage = run_ac_baseline(
-                            test_day, start_offset_ns, horizon_ns, target_qty,
+                            test_day, absolute_start_time_ns, horizon_ns, target_qty,
                             risk_aversion=1e-5,  # High risk aversion
                             timestamp_unit_ns=1000
                         )
@@ -636,7 +660,8 @@ def evaluate_agent(
                         'day': test_day,
                         'horizon_s': horizon_s,
                         'run_idx': run_idx,
-                        'start_time_ns': start_offset_ns,
+                        'relative_offset_ns': relative_offset_ns,
+                        'absolute_start_time_ns': absolute_start_time_ns,
                         'rl_slippage_bps': rl_slippage,
                         'twap_slippage_bps': twap_slippage,
                         'vwap_slippage_bps': vwap_slippage,
