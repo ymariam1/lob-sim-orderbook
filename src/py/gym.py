@@ -776,7 +776,7 @@ class LOBEnv(gym.Env):
             # This encourages the agent to actually trade, not just hold
             # Bonus is proportional to the fraction executed
             execution_progress = qty / self._total_qty
-            execution_bonus = 0.1 * execution_progress  # Positive reward for executing
+            execution_bonus = 1.0 * execution_progress  # Positive reward for executing (was 0.1, increased 10x)
             step_reward += execution_bonus
 
         self._exchange.ClearAgentFills()
