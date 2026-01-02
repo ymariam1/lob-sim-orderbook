@@ -30,6 +30,7 @@ import sys
 import json
 import argparse
 import subprocess
+import glob as glob_module
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Tuple
@@ -117,33 +118,60 @@ def train_model(
         print(f"Evaluating run {run_id}...")
         print(f"{'='*70}")
 
+        # Expand glob pattern to actual files
+        if os.path.isdir(test_data):
+            test_files = glob_module.glob(os.path.join(test_data, "*.csv"))
+            if not test_files:
+                print(f"WARNING: No CSV files found in {test_data}")
+                raise FileNotFoundError(f"No CSV files in {test_data}")
+        else:
+            test_files = [test_data]
+
         eval_cmd = [
             sys.executable,
             "src/py/evaluate.py",
             "--model", f"{save_dir}/best/best_model",
-            "--test-data", test_data + "/*.csv" if os.path.isdir(test_data) else test_data,
+            "--test-data", *test_files,  # Unpack list of files
             "--num-runs", "10",
             "--horizons", "1800", "3600",
             "--data-duration", "24.0",
             "--output-dir", f"{save_dir}/eval_results",
         ]
 
+        print(f"Evaluating on {len(test_files)} test files")
         subprocess.run(eval_cmd, check=True)
 
         # Parse evaluation results
         eval_results = parse_latest_eval_results(f"{save_dir}/eval_results")
+
+        # Check if evaluation actually worked
+        if eval_results.get("rl_slippage") is None:
+            status = "eval_failed"
+            print(f"WARNING: Evaluation produced no results for run {run_id}")
+        else:
+            status = "success"
 
         result = {
             "run_id": run_id,
             "inventory_penalty": inventory_penalty,
             "execution_bonus": execution_bonus,
             "save_dir": save_dir,
-            "status": "success",
+            "status": status,
             **eval_results,
         }
 
     except subprocess.CalledProcessError as e:
         print(f"ERROR in run {run_id}: {e}")
+        result = {
+            "run_id": run_id,
+            "inventory_penalty": inventory_penalty,
+            "execution_bonus": execution_bonus,
+            "save_dir": save_dir,
+            "status": "failed",
+            "error": str(e),
+        }
+    except Exception as e:
+        print(f"UNEXPECTED ERROR in run {run_id}: {e}")
         result = {
             "run_id": run_id,
             "inventory_penalty": inventory_penalty,
@@ -192,21 +220,26 @@ def print_results_table(results: List[Dict]):
     print("-"*80)
 
     for r in results:
-        if r["status"] == "failed":
-            print(f"{r['run_id']:<4} {r['inventory_penalty']:<12.1f} {r['execution_bonus']:<12.1f} {'N/A':<14} {'N/A':<10} {'N/A':<10} {'FAILED':<10}")
+        if r["status"] in ["failed", "eval_failed"]:
+            status_str = "EVAL FAIL" if r["status"] == "eval_failed" else "FAILED"
+            print(f"{r['run_id']:<4} {r['inventory_penalty']:<12.1f} {r['execution_bonus']:<12.1f} {'N/A':<14} {'N/A':<10} {'N/A':<10} {status_str:<10}")
             continue
 
         rl = r.get("rl_slippage")
         twap = r.get("twap_slippage")
 
-        if rl is not None and twap is not None:
-            vs_twap = ((rl - twap) / twap * 100) if twap > 0 else 0
+        # Format values, handling None
+        rl_str = f"{rl:.2f}" if rl is not None else "N/A"
+        twap_str = f"{twap:.2f}" if twap is not None else "N/A"
+
+        if rl is not None and twap is not None and twap > 0:
+            vs_twap = ((rl - twap) / twap * 100)
             vs_str = f"{vs_twap:+.1f}%"
         else:
             vs_str = "N/A"
 
         print(f"{r['run_id']:<4} {r['inventory_penalty']:<12.1f} {r['execution_bonus']:<12.1f} "
-              f"{rl:<14.2f} {twap:<10.2f} {vs_str:<10} {r['status']:<10}")
+              f"{rl_str:<14} {twap_str:<10} {vs_str:<10} {r['status']:<10}")
 
     print("="*80)
 
