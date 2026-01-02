@@ -5,49 +5,46 @@ project(lob_sim_python)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# CRITICAL: For pybind11 3.0+, we MUST find Python3 with Development component
+# BEFORE loading pybind11. This provides python3_add_library command.
+
 # If PYTHON_EXECUTABLE is set (from setup.py), use it
 if(DEFINED PYTHON_EXECUTABLE)
     message(STATUS "Using Python executable: ${PYTHON_EXECUTABLE}")
     set(Python3_EXECUTABLE ${PYTHON_EXECUTABLE})
-    set(PYBIND11_PYTHON_VERSION 3)
 endif()
 
-# Handle Python3_INCLUDE_DIR if provided
-if(DEFINED Python3_INCLUDE_DIR AND EXISTS "${Python3_INCLUDE_DIR}")
-    message(STATUS "Using provided Python3 include dir: ${Python3_INCLUDE_DIR}")
+# Set hints from environment variables if provided
+if(DEFINED Python3_INCLUDE_DIR)
     set(Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIR})
 endif()
 
-# Find pybind11 first - it's better at Python detection
-find_package(pybind11 CONFIG REQUIRED)
-
-# For pybind11 2.x, we use pybind11_add_module which handles everything
-# For pybind11 3.x, we need Python3 Development component
-# Try to find it, but don't fail if we can't - pybind11 2.x doesn't need it
+# Find Python3 with Development component - REQUIRED for pybind11 3.0+
+# Try Development.Module first (works without full Python library)
 find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+
 if(NOT Python3_FOUND)
+    # Fall back to full Development (older CMake or missing Development.Module)
     find_package(Python3 COMPONENTS Interpreter Development QUIET)
 endif()
+
 if(NOT Python3_FOUND)
-    find_package(Python3 COMPONENTS Interpreter QUIET)
+    # Last resort: just Interpreter, let pybind11 handle the rest
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    message(WARNING "Python3 Development component not found. Build may fail.")
 endif()
 
-message(STATUS "pybind11 version: ${pybind11_VERSION}")
-if(Python3_FOUND)
-    message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
-    message(STATUS "Python3 include dirs: ${Python3_INCLUDE_DIRS}")
-endif()
+message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
+message(STATUS "Python3 include dirs: ${Python3_INCLUDE_DIRS}")
+
+# Now find pybind11 - it will use the Python3 we just found
+find_package(pybind11 CONFIG REQUIRED)
 
 # Create the Python Extension Module
 pybind11_add_module(lob_sim bindings.cpp)
 
 # Include directories
 target_include_directories(lob_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-# If we have Python include dirs, add them explicitly
-if(Python3_INCLUDE_DIRS)
-    target_include_directories(lob_sim PRIVATE ${Python3_INCLUDE_DIRS})
-endif()
 
 # Optimization Flags (Critical for HFT simulation performance)
 if(MSVC)
@@ -58,3 +55,4 @@ endif()
 
 # Installation (optional - for pip install)
 install(TARGETS lob_sim DESTINATION .)
+

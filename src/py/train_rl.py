@@ -40,6 +40,7 @@ try:
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import (
         EvalCallback,
+        CheckpointCallback,
         CallbackList,
         BaseCallback,
     )
@@ -521,9 +522,13 @@ def train(
         )
     
     # Callbacks
-    # NOTE: We only save the BEST model (based on eval performance) to save disk space
-    # Intermediate checkpoints are NOT saved
-
+    checkpoint_callback = CheckpointCallback(
+        save_freq=eval_freq,
+        save_path=save_dir,
+        name_prefix=run_name,
+        save_vecnormalize=True,
+    )
+    
     # Sync eval env normalization from training (CRITICAL!)
     # This ensures eval uses frozen train statistics
     eval_callback = EvalCallback(
@@ -535,7 +540,7 @@ def train(
         deterministic=True,
         warn=False,  # Suppress warnings about Monitor wrapper (we already added it)
     )
-
+    
     # Custom callback to sync normalization stats
     class SyncNormalizeCallback(BaseCallback):
         """Sync eval env normalization from training env."""
@@ -544,15 +549,16 @@ def train(
             eval_env.obs_rms = vec_normalize.obs_rms
             eval_env.ret_rms = vec_normalize.ret_rms
             return True
-
+    
     # Enhanced episode logging
     episode_logger = EpisodeLoggerCallback(verbose=verbose, log_freq=100)
-
+    
     # Action distribution diagnostic
     action_dist_callback = ActionDistributionCallback(verbose=verbose, log_freq=1000)
-
+    
     callbacks = CallbackList([
-        eval_callback,  # Only saves best model
+        checkpoint_callback, 
+        eval_callback, 
         episode_logger,
         action_dist_callback,
         SyncNormalizeCallback(),
@@ -568,24 +574,22 @@ def train(
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted!")
-
-    # Save current model state as "latest" for easy resuming
-    # NOTE: The BEST model is already saved by EvalCallback to save_dir/best/
+    
+    # Save final model (CRITICAL: save VecNormalize separately!)
+    final_path = os.path.join(save_dir, f"{run_name}_final")
+    model.save(final_path)
+    vec_normalize.save(final_path + "_vecnormalize.pkl")
+    print(f"\nFinal model saved to: {final_path}")
+    print(f"VecNormalize stats saved to: {final_path}_vecnormalize.pkl")
+    
+    # Also save as "latest" for easy resuming
     latest_path = os.path.join(save_dir, "ppo_lob_latest")
     model.save(latest_path)
     vec_normalize.save(latest_path + "_vecnormalize.pkl")
-
-    print(f"\n{'='*60}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*60}")
-    print(f"Best model saved to: {os.path.join(save_dir, 'best', 'best_model.zip')}")
-    print(f"Latest model saved to: {latest_path}.zip (for resuming)")
-    print(f"VecNormalize stats: {latest_path}_vecnormalize.pkl")
-    print(f"{'='*60}")
-
+    
     vec_normalize.close()
     eval_env.close()
-
+    
     return model
 
 
@@ -756,22 +760,14 @@ def main():
     parser.add_argument("--n-steps", type=int, default=2048, help="Steps per rollout")
     parser.add_argument("--n-epochs", type=int, default=10, help="PPO epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-
-    # Model size (predefined architectures)
-    parser.add_argument("--model-size", choices=["small", "base", "large", "xlarge"],
-                        help="Predefined model size: small=[64,64], base=[128,128], large=[256,256], xlarge=[512,512]")
-    parser.add_argument("--net-arch", type=int, nargs="+", default=None,
-                        help="Custom network architecture (overrides --model-size). Default: [128, 128] if neither specified")
+    parser.add_argument("--net-arch", type=int, nargs="+", default=[64, 64], help="Network architecture")
     
     # Environment
     parser.add_argument("--agent-type", default="institutional", 
                         help="Latency profile: 'hft', 'institutional', 'retail', or 'base_ms:sigma'")
     parser.add_argument("--volume-sensitivity", type=float, default=0.1,
                         help="How much volume affects latency (η)")
-    parser.add_argument("--target-qty", type=int, default=None, 
-                        help="Target quantity to execute per episode (if None, calculated from target-qty-pct)")
-    parser.add_argument("--target-qty-pct", type=float, default=0.03,
-                        help="Target quantity as percentage of daily volume (default 0.03 = 3%%, range 0.01-0.05)")
+    parser.add_argument("--target-qty", type=int, default=100, help="Target quantity to execute per episode")
     parser.add_argument("--side", choices=["BUY", "SELL"], default="SELL", help="Execution side")
     parser.add_argument("--inventory-penalty-coef", type=float, default=0.01,
                         help="Penalty coefficient for holding inventory (Almgren-Chriss style, default 0.01)")
@@ -795,25 +791,7 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     
     args = parser.parse_args()
-
-    # Handle model size presets
-    if args.model_size and args.net_arch:
-        print("Warning: Both --model-size and --net-arch specified. Using --net-arch.")
-    elif args.model_size:
-        # Map model size to architecture
-        size_map = {
-            "small": [64, 64],
-            "base": [128, 128],
-            "large": [256, 256],
-            "xlarge": [512, 512],
-        }
-        args.net_arch = size_map[args.model_size]
-        print(f"Using {args.model_size} model: {args.net_arch}")
-    elif args.net_arch is None:
-        # Default to base if neither specified
-        args.net_arch = [128, 128]
-        print(f"Using default (base) model: {args.net_arch}")
-
+    
     # Disable wandb if requested
     if args.no_wandb:
         global WANDB_AVAILABLE

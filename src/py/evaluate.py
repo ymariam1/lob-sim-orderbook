@@ -97,15 +97,27 @@ def run_rl_episode(
 
     # CRITICAL: VecNormalize must wrap the env BEFORE use
     # Cannot use normalize_obs() - must wrap entire env
-    if vec_normalize:
-        # Update the env in vec_normalize wrapper
-        vec_normalize.set_venv(DummyVecEnv([lambda: env]))
-        vec_normalize.training = False
-        vec_normalize.norm_reward = False
+    try:
+        if vec_normalize:
+            # Update the env in vec_normalize wrapper
+            vec_normalize.set_venv(DummyVecEnv([lambda: env]))
+            vec_normalize.training = False
+            vec_normalize.norm_reward = False
+            # Use wrapped env for prediction
+            wrapped_env = vec_normalize
+        else:
+            wrapped_env = env
 
-    # Reset with start_time_ns parameter
-    obs, info = env.reset(options={"start_time_ns": start_time_ns})
-    arrival_price = info.get("arrival_price", 0.0)
+        # Reset with start_time_ns parameter
+        obs, info = env.reset(options={"start_time_ns": start_time_ns})
+        arrival_price = info.get("arrival_price", 0.0)
+
+    except Exception as e:
+        print(f"\n    ERROR during RL setup/reset: {e}")
+        import traceback
+        traceback.print_exc()
+        env.close()
+        return 1000.0, 0.0, {"error": str(e)}
 
     # Run episode with try-finally to ensure cleanup
     total_reward = 0
@@ -130,7 +142,12 @@ def run_rl_episode(
                         break
 
                 # Get action from agent
-                action, _ = agent.predict(obs, deterministic=True)
+                # If using VecNormalize, need to normalize observation before prediction
+                if vec_normalize:
+                    # VecNormalize expects vectorized input
+                    action, _ = agent.predict(obs, deterministic=True)
+                else:
+                    action, _ = agent.predict(obs, deterministic=True)
                 actions.append(action)
 
                 # Step
@@ -750,6 +767,24 @@ def evaluate_agent(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = os.path.join(output_dir, f"eval_results_{timestamp}.json")
     
+    # Convert stats to JSON-serializable format (convert bools to ints/strings)
+    def make_json_serializable(obj):
+        """Convert numpy/bool types to JSON-serializable types."""
+        if isinstance(obj, dict):
+            return {k: make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [make_json_serializable(v) for v in obj]
+        elif isinstance(obj, np.bool_):
+            return bool(obj)  # Convert numpy bool to Python bool
+        elif isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, bool):
+            return bool(obj)  # Explicitly convert to Python bool
+        else:
+            return obj
+
     output_data = {
         'agent_path': agent_path,
         'test_data_paths': test_data_paths,
@@ -765,10 +800,10 @@ def evaluate_agent(
             'twap_mean': float(np.mean(results['twap'])) if results['twap'] else None,
             'ac_mean': float(np.mean(results['ac'])) if results['ac'] else None,
         },
-        'statistics': stats,
+        'statistics': make_json_serializable(stats),
         'metadata': results['metadata'],
     }
-    
+
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2)
     

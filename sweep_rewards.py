@@ -82,6 +82,7 @@ def train_model(
     timesteps: int,
     model_size: str,
     run_id: int,
+    skip_eval: bool = False,
 ) -> Dict:
     """Train a single model with given hyperparameters."""
 
@@ -111,7 +112,28 @@ def train_model(
 
     try:
         print(f"Training with command: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
+        result_train = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result_train.returncode != 0:
+            print(f"TRAINING FAILED with exit code {result_train.returncode}")
+            print(f"STDERR:\n{result_train.stderr[-1000:]}")  # Last 1000 chars
+            raise subprocess.CalledProcessError(result_train.returncode, cmd)
+
+        print(f"✓ Training completed successfully")
+
+        # Skip evaluation if requested
+        if skip_eval:
+            print(f"Skipping evaluation (--skip-eval flag set)")
+            result = {
+                "run_id": run_id,
+                "inventory_penalty": inventory_penalty,
+                "execution_bonus": execution_bonus,
+                "save_dir": save_dir,
+                "status": "trained_only",
+                "rl_slippage": None,
+                "twap_slippage": None,
+            }
+            return result
 
         # Evaluate the best model
         print(f"\n{'='*70}")
@@ -139,7 +161,13 @@ def train_model(
         ]
 
         print(f"Evaluating on {len(test_files)} test files")
-        subprocess.run(eval_cmd, check=True)
+        result_eval = subprocess.run(eval_cmd, capture_output=True, text=True)
+
+        if result_eval.returncode != 0:
+            print(f"EVALUATION FAILED with exit code {result_eval.returncode}")
+            print(f"STDOUT:\n{result_eval.stdout}")
+            print(f"STDERR:\n{result_eval.stderr}")
+            raise subprocess.CalledProcessError(result_eval.returncode, eval_cmd, result_eval.stdout, result_eval.stderr)
 
         # Parse evaluation results
         eval_results = parse_latest_eval_results(f"{save_dir}/eval_results")
@@ -289,6 +317,8 @@ def main():
     # Resume
     parser.add_argument("--resume-from", type=int,
                         help="Resume from specific run ID (skip earlier runs)")
+    parser.add_argument("--skip-eval", action="store_true",
+                        help="Skip evaluation, only train models (faster, evaluate manually later)")
 
     args = parser.parse_args()
 
@@ -339,6 +369,7 @@ def main():
             timesteps=timesteps,
             model_size=args.model_size,
             run_id=run_id,
+            skip_eval=args.skip_eval,
         )
         results.append(result)
 
