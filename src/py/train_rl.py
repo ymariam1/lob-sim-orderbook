@@ -760,7 +760,9 @@ def main():
     parser.add_argument("--n-steps", type=int, default=2048, help="Steps per rollout")
     parser.add_argument("--n-epochs", type=int, default=10, help="PPO epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--net-arch", type=int, nargs="+", default=[64, 64], help="Network architecture")
+    parser.add_argument("--net-arch", type=int, nargs="+", default=None, help="Network architecture (overrides --model-size)")
+    parser.add_argument("--model-size", choices=["small", "base", "large", "xlarge"], default="base",
+                        help="Model architecture size (small=[32,32], base=[64,64], large=[128,128], xlarge=[256,256])")
     
     # Environment
     parser.add_argument("--agent-type", default="institutional", 
@@ -791,11 +793,21 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     
     args = parser.parse_args()
-    
+
     # Disable wandb if requested
     if args.no_wandb:
         global WANDB_AVAILABLE
         WANDB_AVAILABLE = False
+
+    # Convert model-size to net-arch if net-arch not explicitly provided
+    if args.net_arch is None:
+        model_size_map = {
+            "small": [32, 32],
+            "base": [64, 64],
+            "large": [128, 128],
+            "xlarge": [256, 256],
+        }
+        args.net_arch = model_size_map[args.model_size]
     
     # Check training data exists (handles both files and directories)
     try:
@@ -854,7 +866,6 @@ def main():
             execution_side=args.side,
             render=args.render,
             inventory_penalty_coef=args.inventory_penalty_coef,
-            target_qty_pct=args.target_qty_pct,
         )
     else:
         train(
@@ -879,7 +890,6 @@ def main():
             verbose=0 if args.quiet else 1,
             inventory_penalty_coef=args.inventory_penalty_coef,
             ent_coef=args.ent_coef,
-            target_qty_pct=args.target_qty_pct,
         )
 
 
