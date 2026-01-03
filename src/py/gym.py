@@ -776,7 +776,9 @@ class LOBEnv(gym.Env):
             # This encourages the agent to actually trade, not just hold
             # Bonus is proportional to the fraction executed
             execution_progress = qty / self._total_qty
-            execution_bonus = 1.0 * execution_progress  # Positive reward for executing (was 0.1, increased 10x)
+            execution_bonus = 10.0 * execution_progress  # CRITICAL FIX: Increased from 1.0 to 10.0
+            # This makes execution rewarding relative to penalties
+            # Full execution now gives +10.0 reward vs -10.0 terminal penalty for 0% execution
             step_reward += execution_bonus
 
         self._exchange.ClearAgentFills()
@@ -800,9 +802,11 @@ class LOBEnv(gym.Env):
         # Higher inventory_penalty_coef = stronger urgency to trade
         fraction_remaining = remaining / self._total_qty
 
-        # Penalty scales linearly with remaining inventory
-        # With default coef=1.0, penalty is -0.1 per step when 100% remaining
-        penalty = -0.1 * fraction_remaining * self.inventory_penalty_coef
+        # CRITICAL FIX: Reduced penalty from -0.1 to -0.001 (100x smaller)
+        # The old value (-0.1) accumulated too much over long episodes
+        # With 1000 steps, -0.1 * 1000 = -100 penalty, overwhelming the execution bonus
+        # New value: -0.001 * 1000 = -1.0 penalty, balanced with execution bonus
+        penalty = -0.001 * fraction_remaining * self.inventory_penalty_coef
 
         return penalty
     

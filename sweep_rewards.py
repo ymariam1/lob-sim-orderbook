@@ -108,15 +108,18 @@ def train_model(
         "--model-size", model_size,
         "--inventory-penalty-coef", str(inventory_penalty),
         "--save-dir", save_dir,
+        "--no-wandb",  # Disable wandb to avoid interactive prompts
     ]
 
     try:
         print(f"Training with command: {' '.join(cmd)}")
-        result_train = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"Training in progress (this may take ~50 minutes)...")
+
+        # Run with real-time output instead of capturing
+        result_train = subprocess.run(cmd)
 
         if result_train.returncode != 0:
-            print(f"TRAINING FAILED with exit code {result_train.returncode}")
-            print(f"STDERR:\n{result_train.stderr[-1000:]}")  # Last 1000 chars
+            print(f"\nTRAINING FAILED with exit code {result_train.returncode}")
             raise subprocess.CalledProcessError(result_train.returncode, cmd)
 
         print(f"✓ Training completed successfully")
@@ -160,14 +163,12 @@ def train_model(
             "--output-dir", f"{save_dir}/eval_results",
         ]
 
-        print(f"Evaluating on {len(test_files)} test files")
-        result_eval = subprocess.run(eval_cmd, capture_output=True, text=True)
+        print(f"Evaluating on {len(test_files)} test files...")
+        result_eval = subprocess.run(eval_cmd)
 
         if result_eval.returncode != 0:
-            print(f"EVALUATION FAILED with exit code {result_eval.returncode}")
-            print(f"STDOUT:\n{result_eval.stdout}")
-            print(f"STDERR:\n{result_eval.stderr}")
-            raise subprocess.CalledProcessError(result_eval.returncode, eval_cmd, result_eval.stdout, result_eval.stderr)
+            print(f"\nEVALUATION FAILED with exit code {result_eval.returncode}")
+            raise subprocess.CalledProcessError(result_eval.returncode, eval_cmd)
 
         # Parse evaluation results
         eval_results = parse_latest_eval_results(f"{save_dir}/eval_results")
@@ -297,11 +298,11 @@ def main():
 
     # Custom sweep
     parser.add_argument("--inventory-penalties", type=float, nargs="+",
-                        default=[0.5, 1.0, 2.0, 5.0, 10.0],
-                        help="Inventory penalty coefficients to try")
+                        default=[0.1, 0.5, 1.0, 2.0, 5.0],
+                        help="Inventory penalty coefficients to try (NEW: 0.1-5.0 range)")
     parser.add_argument("--execution-bonuses", type=float, nargs="+",
-                        default=[0.5, 1.0, 2.0],
-                        help="Execution bonus multipliers to try")
+                        default=[5.0, 10.0, 20.0],
+                        help="Execution bonus multipliers to try (NEW: 5.0-20.0 range, increased from 0.5-2.0)")
 
     # Training params
     parser.add_argument("--train-data", default="data/train",
@@ -324,13 +325,13 @@ def main():
 
     # Handle presets
     if args.quick:
-        inventory_penalties = [1.0, 2.0, 5.0]
-        execution_bonuses = [1.0]
+        inventory_penalties = [0.1, 0.5, 1.0]
+        execution_bonuses = [5.0, 10.0, 20.0]
         timesteps = 200000
-        print("QUICK SWEEP MODE: 3 runs, 200k steps each")
+        print("QUICK SWEEP MODE: 9 runs, 200k steps each")
     elif args.full:
-        inventory_penalties = [0.5, 1.0, 2.0, 5.0, 10.0]
-        execution_bonuses = [0.5, 1.0, 2.0]
+        inventory_penalties = [0.1, 0.5, 1.0, 2.0, 5.0]
+        execution_bonuses = [5.0, 10.0, 20.0]
         timesteps = 500000
         print("FULL SWEEP MODE: 15 runs, 500k steps each")
     else:
