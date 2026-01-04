@@ -9,7 +9,7 @@ Based on best practices from rl-exec.pdf:
 - Effect sizes and win rates
 
 Recent Updates:
-- Updated environment parameters (5s warmup, inventory_penalty_coef=1.0)
+- CRITICAL FIX: Match evaluation parameters to training defaults (60s warmup, inventory_penalty_coef=0.01)
 - Fixed VecNormalize usage (set_venv method)
 - CRITICAL FIX: Convert relative offsets to absolute timestamps (was causing 0 fills!)
   * CSV files have absolute Unix epoch timestamps (e.g., 1738386000422432 microseconds)
@@ -83,16 +83,17 @@ def run_rl_episode(
     Returns:
         (slippage_bps, completion_rate, episode_info)
     """
-    # Create environment with UPDATED parameters
+    # Create environment with parameters MATCHING TRAINING
+    # CRITICAL: These must match train_rl.py defaults to avoid distribution shift
     env = LOBEnv(
         data_path=data_path,
         agent_type=agent_type,
         timestamp_unit_ns=1000,  # Tardis microseconds
         target_qty=target_qty,
         execution_side=execution_side,
-        warmup_duration_ns=5_000_000_000,  # 5s warmup (updated from 60s)
+        warmup_duration_ns=60_000_000_000,  # 60s warmup (MUST MATCH TRAINING!)
         step_duration_ns=10_000_000,  # 10ms steps
-        inventory_penalty_coef=1.0,  # NEW DEFAULT (increased from 0.01)
+        inventory_penalty_coef=0.01,  # MUST MATCH TRAINING DEFAULT (was 1.0, causing 100x harsher penalty!)
     )
 
     # CRITICAL: VecNormalize must wrap the env BEFORE use
@@ -450,7 +451,7 @@ def evaluate_agent(
     test_data_paths: List[str],
     num_runs_per_day: int = 10,
     horizons: List[int] = [1800, 3600, 7200],  # 30min, 1h, 2h in seconds
-    target_qty: int = 1000,
+    target_qty: int = 100,  # CRITICAL: Must match training default (was 1000, causing 10x mismatch!)
     agent_type: str = "institutional",
     execution_side: str = "SELL",
     output_dir: str = "results",
@@ -827,8 +828,8 @@ def main():
                         help="Number of runs per day (default: 10)")
     parser.add_argument("--horizons", type=int, nargs="+", default=[1800, 3600, 7200],
                         help="Time horizons in seconds (default: 1800 3600 7200)")
-    parser.add_argument("--target-qty", type=int, default=1000,
-                        help="Target quantity to execute (default: 1000)")
+    parser.add_argument("--target-qty", type=int, default=100,
+                        help="Target quantity to execute (default: 100, must match training!)")
     parser.add_argument("--agent-type", default="institutional",
                         help="Agent latency profile (default: institutional)")
     parser.add_argument("--side", choices=["BUY", "SELL"], default="SELL",
