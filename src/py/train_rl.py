@@ -237,6 +237,10 @@ def make_env(
     allow_random_selection: bool = True,
     inventory_penalty_coef: float = 0.01,
     target_qty_pct: float = 0.03,  # Percentage of daily volume (1-5% = 0.01-0.05)
+    # Maker/taker fee structure
+    taker_fee_bps: float = 30.0,  # Fee for market orders
+    maker_rebate_bps: float = 20.0,  # Rebate for limit order fills
+    execution_bonus: float = 0.5,  # Base bonus per unit executed
 ):
     """
     Create a wrapped LOBEnv for training.
@@ -280,6 +284,9 @@ def make_env(
             latency_seed=latency_seed,
             inventory_penalty_coef=inventory_penalty_coef,
             target_qty_pct=target_qty_pct,
+            taker_fee_bps=taker_fee_bps,
+            maker_rebate_bps=maker_rebate_bps,
+            execution_bonus=execution_bonus,
         )
         # Wrap with Monitor for logging
         if log_dir:
@@ -309,9 +316,13 @@ def train(
     max_eval_episode_steps: int = 10000,  # Max steps per eval episode (prevents hangs)
     resume_path: str = None,
     verbose: int = 1,
-    inventory_penalty_coef: float = 0.01,
-    ent_coef: float = 0.0,
+    inventory_penalty_coef: float = 1.0,  # Increased from 0.01
+    ent_coef: float = 0.01,  # Increased from 0.0 for exploration
     target_qty_pct: float = 0.03,  # Percentage of daily volume (1-5% = 0.01-0.05)
+    # Maker/taker fee structure
+    taker_fee_bps: float = 30.0,
+    maker_rebate_bps: float = 20.0,
+    execution_bonus: float = 0.5,
 ):
     """
     Train a PPO agent on the LOB environment.
@@ -405,6 +416,9 @@ def train(
                     "net_arch": net_arch,
                     "inventory_penalty_coef": inventory_penalty_coef,
                     "ent_coef": ent_coef,
+                    "taker_fee_bps": taker_fee_bps,
+                    "maker_rebate_bps": maker_rebate_bps,
+                    "execution_bonus": execution_bonus,
                 },
                 sync_tensorboard=True,
             )
@@ -452,6 +466,9 @@ def train(
             allow_random_selection=True,  # Random selection for training diversity
             inventory_penalty_coef=inventory_penalty_coef,
             target_qty_pct=target_qty_pct,
+            taker_fee_bps=taker_fee_bps,
+            maker_rebate_bps=maker_rebate_bps,
+            execution_bonus=execution_bonus,
         )
     ])
     
@@ -477,6 +494,9 @@ def train(
             allow_random_selection=False,  # Use first file for consistency in eval
             inventory_penalty_coef=inventory_penalty_coef,
             target_qty_pct=target_qty_pct,
+            taker_fee_bps=taker_fee_bps,
+            maker_rebate_bps=maker_rebate_bps,
+            execution_bonus=execution_bonus,
         )
         env = env_factory()
         # Set max episode steps to prevent infinite episodes during eval
@@ -771,11 +791,19 @@ def main():
                         help="How much volume affects latency (η)")
     parser.add_argument("--target-qty", type=int, default=100, help="Target quantity to execute per episode")
     parser.add_argument("--side", choices=["BUY", "SELL"], default="SELL", help="Execution side")
-    parser.add_argument("--inventory-penalty-coef", type=float, default=0.01,
-                        help="Penalty coefficient for holding inventory (Almgren-Chriss style, default 0.01)")
-    parser.add_argument("--ent-coef", type=float, default=0.0,
-                        help="Entropy coefficient for exploration (default 0.0, try 0.01-0.05 if stuck)")
-    
+    parser.add_argument("--inventory-penalty-coef", type=float, default=1.0,
+                        help="Penalty coefficient for holding inventory (default 1.0)")
+    parser.add_argument("--ent-coef", type=float, default=0.01,
+                        help="Entropy coefficient for exploration (default 0.01, try 0.0-0.05)")
+
+    # Maker/Taker fees (CRITICAL for incentivizing limit orders)
+    parser.add_argument("--taker-fee-bps", type=float, default=30.0,
+                        help="Taker fee (penalty) for market orders in basis points (default 30)")
+    parser.add_argument("--maker-rebate-bps", type=float, default=20.0,
+                        help="Maker rebate (bonus) for limit order fills in basis points (default 20)")
+    parser.add_argument("--execution-bonus", type=float, default=0.5,
+                        help="Base bonus per unit executed (default 0.5, was 10.0)")
+
     # Saving/Loading
     parser.add_argument("--save-dir", default="models", help="Model save directory")
     parser.add_argument("--log-dir", default="logs", help="Log directory")
@@ -890,6 +918,9 @@ def main():
             verbose=0 if args.quiet else 1,
             inventory_penalty_coef=args.inventory_penalty_coef,
             ent_coef=args.ent_coef,
+            taker_fee_bps=args.taker_fee_bps,
+            maker_rebate_bps=args.maker_rebate_bps,
+            execution_bonus=args.execution_bonus,
         )
 
 

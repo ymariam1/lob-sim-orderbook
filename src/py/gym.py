@@ -134,6 +134,10 @@ class LOBEnv(gym.Env):
         inventory_penalty_coef: float = 1.0,  # Penalty coefficient for holding inventory (INCREASED from 0.01)
         max_episode_steps: int = 10000,  # Maximum steps per episode (prevents infinite episodes)
         target_qty_pct: float = 0.03,  # Percentage of daily volume to use as target (1-5% = 0.01-0.05)
+        # Maker/Taker fee structure to incentivize limit orders
+        taker_fee_bps: float = 30.0,  # Fee for aggressive (market) orders in basis points
+        maker_rebate_bps: float = 20.0,  # Rebate for passive (limit) order fills in basis points
+        execution_bonus: float = 0.5,  # Bonus per unit executed (reduced from 10.0 to make fees matter)
     ):
         """
         Initialize the LOB environment.
@@ -168,6 +172,12 @@ class LOBEnv(gym.Env):
                 - 10.0: Very strong - agent will prioritize speed over price
             max_episode_steps: Maximum steps per episode before truncation (prevents infinite episodes)
             target_qty_pct: Percentage of daily volume to use as target (default 0.03 = 3%)
+            taker_fee_bps: Fee (penalty) for aggressive market orders in basis points.
+                This simulates exchange fees and spread costs. Higher = more incentive for limit orders.
+            maker_rebate_bps: Rebate (bonus) for passive limit order fills in basis points.
+                This simulates maker rebates. Higher = more incentive to provide liquidity.
+            execution_bonus: Base bonus per unit executed (scaled by progress).
+                Reduced from 10.0 to 0.5 to make maker/taker fees meaningful.
         """
         super().__init__()
         
@@ -198,7 +208,15 @@ class LOBEnv(gym.Env):
         self.latency_seed = latency_seed
         self.inventory_penalty_coef = inventory_penalty_coef
         self._max_episode_steps = max_episode_steps
-        
+
+        # Maker/Taker fee structure (simulates real exchange economics)
+        self.taker_fee_bps = taker_fee_bps  # Penalty for market orders
+        self.maker_rebate_bps = maker_rebate_bps  # Bonus for limit order fills
+        self.execution_bonus = execution_bonus  # Base bonus per unit executed
+
+        # Track last action to determine maker/taker for reward calculation
+        self._last_action = 0  # 0=hold, 1-5=limit, 6=market, 7=cancel
+
         # Create latency components (separated environment vs agent state)
         # MarketConditions: Updated ONCE per step (shared by all agents)
         # AgentLatencyModel: Agent-specific jitter sampling
@@ -287,7 +305,8 @@ class LOBEnv(gym.Env):
         self._order_id_counter = 1_000_000
         self._active_orders.clear()
         self._step_count = 0  # Reset step counter
-        
+        self._last_action = 0  # Reset action tracking
+
         # Reset Implementation Shortfall tracking
         self._executed_qty = 0
         self._execution_cost = 0.0
@@ -401,9 +420,12 @@ class LOBEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
+        # Track action for maker/taker fee calculation
+        self._last_action = action
+
         # 1. Execute Agent Action (Place Order / Cancel)
         self._execute_action(action)
-        
+
         # 2. VITAL: Pump the Market Data Forward
         # This advances market time and processes historical events
         events_processed = 0
@@ -776,10 +798,23 @@ class LOBEnv(gym.Env):
             # This encourages the agent to actually trade, not just hold
             # Bonus is proportional to the fraction executed
             execution_progress = qty / self._total_qty
-            execution_bonus = 10.0 * execution_progress  # CRITICAL FIX: Increased from 1.0 to 10.0
-            # This makes execution rewarding relative to penalties
-            # Full execution now gives +10.0 reward vs -10.0 terminal penalty for 0% execution
+            execution_bonus = self.execution_bonus * execution_progress
             step_reward += execution_bonus
+
+            # MAKER/TAKER FEE STRUCTURE
+            # This is CRITICAL for incentivizing limit orders over market orders
+            # Action 6 = Market order (taker, crosses spread, pays fee)
+            # Action 1-5 = Limit order (maker, provides liquidity, gets rebate)
+            if self._last_action == 6:
+                # Market order: Apply taker fee (penalty)
+                # Fee is proportional to execution size
+                taker_fee = (self.taker_fee_bps / 10000.0) * price * qty / self._arrival_price
+                step_reward -= taker_fee
+            elif 1 <= self._last_action <= 5:
+                # Limit order: Apply maker rebate (bonus)
+                # Rebate is proportional to execution size
+                maker_rebate = (self.maker_rebate_bps / 10000.0) * price * qty / self._arrival_price
+                step_reward += maker_rebate
 
         self._exchange.ClearAgentFills()
         return step_reward
@@ -802,11 +837,14 @@ class LOBEnv(gym.Env):
         # Higher inventory_penalty_coef = stronger urgency to trade
         fraction_remaining = remaining / self._total_qty
 
-        # CRITICAL FIX: Reduced penalty from -0.1 to -0.001 (100x smaller)
-        # The old value (-0.1) accumulated too much over long episodes
-        # With 1000 steps, -0.1 * 1000 = -100 penalty, overwhelming the execution bonus
-        # New value: -0.001 * 1000 = -1.0 penalty, balanced with execution bonus
-        penalty = -0.001 * fraction_remaining * self.inventory_penalty_coef
+        # Base penalty per step: -0.005
+        # With coef=1, 1000 steps at 50% average remaining: -0.005 * 0.5 * 1000 = -2.5 total
+        # This provides moderate urgency without overwhelming maker/taker signals
+        # Scale with inventory_penalty_coef to allow tuning:
+        #   coef=0.1: ~0.25 penalty total (very gentle)
+        #   coef=1.0: ~2.5 penalty total (moderate urgency)
+        #   coef=5.0: ~12.5 penalty total (strong urgency)
+        penalty = -0.005 * fraction_remaining * self.inventory_penalty_coef
 
         return penalty
     

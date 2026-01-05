@@ -37,41 +37,7 @@ from typing import List, Dict, Tuple
 import itertools
 
 
-def edit_gym_execution_bonus(bonus_value: float):
-    """
-    Temporarily edit gym.py to change execution bonus.
-    Returns the original value so it can be restored.
-    """
-    gym_path = Path("src/py/gym.py")
-
-    # Read current file
-    with open(gym_path, 'r') as f:
-        lines = f.readlines()
-
-    # Find and modify the execution bonus line
-    original_value = None
-    for i, line in enumerate(lines):
-        if "execution_bonus =" in line and "execution_progress" in line:
-            # Extract current value
-            parts = line.split("=")[1].split("*")[0].strip()
-            try:
-                original_value = float(parts)
-            except:
-                original_value = 1.0  # Default from our recent change
-
-            # Replace with new value
-            indent = len(line) - len(line.lstrip())
-            lines[i] = f"{' ' * indent}execution_bonus = {bonus_value} * execution_progress  # Sweep parameter\n"
-            break
-
-    # Write modified file
-    with open(gym_path, 'w') as f:
-        f.writelines(lines)
-
-    # Clear Python cache
-    subprocess.run(["rm", "-rf", "src/py/__pycache__"], check=False)
-
-    return original_value
+# Note: execution_bonus is now a command-line argument, no need to edit gym.py
 
 
 def train_model(
@@ -83,22 +49,22 @@ def train_model(
     model_size: str,
     run_id: int,
     skip_eval: bool = False,
+    taker_fee_bps: float = 30.0,
+    maker_rebate_bps: float = 20.0,
 ) -> Dict:
     """Train a single model with given hyperparameters."""
 
-    # Edit gym.py to set execution bonus
     print(f"\n{'='*70}")
     print(f"RUN {run_id}: inventory_penalty={inventory_penalty}, execution_bonus={execution_bonus}")
+    print(f"  taker_fee={taker_fee_bps}bps, maker_rebate={maker_rebate_bps}bps")
     print(f"{'='*70}")
-
-    original_bonus = edit_gym_execution_bonus(execution_bonus)
 
     # Create unique save directory for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = f"models/sweep_run_{run_id}_inv{inventory_penalty}_exec{execution_bonus}_{timestamp}"
     os.makedirs(save_dir, exist_ok=True)
 
-    # Train command
+    # Train command - all reward parameters now passed via CLI
     cmd = [
         sys.executable,
         "src/py/train_rl.py",
@@ -107,6 +73,9 @@ def train_model(
         "--timesteps", str(timesteps),
         "--model-size", model_size,
         "--inventory-penalty-coef", str(inventory_penalty),
+        "--execution-bonus", str(execution_bonus),
+        "--taker-fee-bps", str(taker_fee_bps),
+        "--maker-rebate-bps", str(maker_rebate_bps),
         "--save-dir", save_dir,
         "--no-wandb",  # Disable wandb to avoid interactive prompts
     ]
@@ -209,9 +178,6 @@ def train_model(
             "status": "failed",
             "error": str(e),
         }
-    finally:
-        # Restore original execution bonus
-        edit_gym_execution_bonus(original_bonus)
 
     return result
 
