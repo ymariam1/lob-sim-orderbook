@@ -13,10 +13,10 @@ Usage:
     # Full sweep (15 models, 500k steps each)
     python sweep_rewards.py --full
 
-    # Custom sweep
+    # Custom sweep (execution_bonus must be small so maker/taker fees matter!)
     python sweep_rewards.py \
         --inventory-penalties 0.5 1.0 2.0 5.0 \
-        --execution-bonuses 0.5 1.0 2.0 \
+        --execution-bonuses 0.1 0.3 0.5 1.0 \
         --timesteps 500000 \
         --train-data data/train \
         --test-data data/test
@@ -264,11 +264,11 @@ def main():
 
     # Custom sweep
     parser.add_argument("--inventory-penalties", type=float, nargs="+",
-                        default=[0.1, 0.5, 1.0, 2.0, 5.0],
-                        help="Inventory penalty coefficients to try (NEW: 0.1-5.0 range)")
+                        default=[0.5, 1.0, 2.0, 5.0],
+                        help="Inventory penalty coefficients to try (0.5-5.0 range)")
     parser.add_argument("--execution-bonuses", type=float, nargs="+",
-                        default=[5.0, 10.0, 20.0],
-                        help="Execution bonus multipliers to try (NEW: 5.0-20.0 range, increased from 0.5-2.0)")
+                        default=[0.1, 0.3, 0.5, 1.0],
+                        help="Execution bonus multipliers to try (MUST be small: 0.1-1.0 so maker/taker fees matter)")
 
     # Training params
     parser.add_argument("--train-data", default="data/train",
@@ -290,16 +290,20 @@ def main():
     args = parser.parse_args()
 
     # Handle presets
+    # NOTE: execution_bonus must be SMALL (< 1.0) so maker/taker fees dominate
+    # With taker_fee=30bps and maker_rebate=20bps:
+    #   - If exec_bonus >> fees, agent ignores maker/taker distinction
+    #   - If exec_bonus ~ 0.1-0.5, fees drive limit vs market decision
     if args.quick:
-        inventory_penalties = [0.1, 0.5, 1.0]
-        execution_bonuses = [5.0, 10.0, 20.0]
+        inventory_penalties = [0.5, 1.0, 2.0]
+        execution_bonuses = [0.1, 0.3, 0.5]  # REDUCED from 5.0-20.0
         timesteps = 200000
         print("QUICK SWEEP MODE: 9 runs, 200k steps each")
     elif args.full:
-        inventory_penalties = [0.1, 0.5, 1.0, 2.0, 5.0]
-        execution_bonuses = [5.0, 10.0, 20.0]
+        inventory_penalties = [0.5, 1.0, 2.0, 5.0]
+        execution_bonuses = [0.1, 0.3, 0.5, 1.0]  # REDUCED from 5.0-20.0
         timesteps = 500000
-        print("FULL SWEEP MODE: 15 runs, 500k steps each")
+        print("FULL SWEEP MODE: 16 runs, 500k steps each")
     else:
         inventory_penalties = args.inventory_penalties
         execution_bonuses = args.execution_bonuses
