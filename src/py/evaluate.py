@@ -97,21 +97,29 @@ def run_rl_episode(
     )
 
     # CRITICAL: VecNormalize must wrap the env BEFORE use
-    # Cannot use normalize_obs() - must wrap entire env
+    # The agent was trained with normalized observations - we MUST use the same normalization
     try:
         if vec_normalize:
-            # Update the env in vec_normalize wrapper
-            vec_normalize.set_venv(DummyVecEnv([lambda: env]))
+            # Wrap env in DummyVecEnv (required by VecNormalize)
+            dummy_vec_env = DummyVecEnv([lambda: env])
+            # Apply the saved VecNormalize wrapper
+            vec_normalize.set_venv(dummy_vec_env)
             vec_normalize.training = False
             vec_normalize.norm_reward = False
-            # Use wrapped env for prediction
             wrapped_env = vec_normalize
+            use_vec_env = True
         else:
             wrapped_env = env
+            use_vec_env = False
 
-        # Reset with start_time_ns parameter
+        # Reset the environment with start_time options
         obs, info = env.reset(options={"start_time_ns": start_time_ns})
         arrival_price = info.get("arrival_price", 0.0)
+
+        # Normalize observation if using VecNormalize
+        if use_vec_env:
+            # VecNormalize.normalize_obs expects shape (n_envs, obs_dim)
+            obs = vec_normalize.normalize_obs(obs.reshape(1, -1))
 
     except Exception as e:
         print(f"\n    ERROR during RL setup/reset: {e}")
@@ -142,17 +150,20 @@ def run_rl_episode(
                         # Gracefully exit if we run out of data
                         break
 
-                # Get action from agent
-                # If using VecNormalize, need to normalize observation before prediction
-                if vec_normalize:
-                    # VecNormalize expects vectorized input
-                    action, _ = agent.predict(obs, deterministic=True)
-                else:
-                    action, _ = agent.predict(obs, deterministic=True)
+                # Get action from agent (obs is normalized if using VecNormalize)
+                action, _ = agent.predict(obs, deterministic=True)
+                # Handle vectorized action output
+                if hasattr(action, '__len__') and len(action) == 1:
+                    action = action[0]
                 actions.append(action)
 
-                # Step
+                # Step through the raw environment
                 obs, reward, term, trunc, info = env.step(action)
+
+                # Normalize observation for next prediction
+                if use_vec_env:
+                    obs = vec_normalize.normalize_obs(obs.reshape(1, -1))
+
                 total_reward += reward
                 step_count += 1
 
@@ -174,6 +185,8 @@ def run_rl_episode(
             except Exception as e:
                 # Gracefully handle errors during episode
                 print(f"\n    WARNING: Episode error at step {step_count}: {e}")
+                import traceback
+                traceback.print_exc()
                 break
 
         # Final metrics
